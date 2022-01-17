@@ -12,10 +12,10 @@ VERSION = '0.1.1'
 PACKAGE_NAME = 'Espalier'
 AUTHOR = 'David Rasmussen'
 AUTHOR_EMAIL = 'drasmus@ncsu.edu'
-URL = 'https://github.ncsu.edu/phylodynamics-lab/Espalier'
+URL = 'https://github.com/davidrasm/Espalier'
 
 LICENSE = 'Apache License 2.0'
-DESCRIPTION = 'Espalier reconciles discordant trees and reconcstructs ARGs using maximum agreement forests.'
+DESCRIPTION = 'Espalier is a Python package for working with discordant phylogenetic trees using maximum agreement forests'
 LONG_DESCRIPTION = (HERE / "README.md").read_text()
 LONG_DESC_TYPE = "text/markdown"
 
