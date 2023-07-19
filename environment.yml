@@ -1,0 +1,12 @@
+name: espalier
+channels:
+dependencies:
+  - python=3.10.*
+  - scipy
+  - numpy
+  - matplotlib
+  - pandas
+  - seaborn
+  - spyder
+  - biopython
+  - dendropy

@@ -9,7 +9,9 @@ For further information on how to use Espalier, please see the [primer][primer] 
 
 For more information on the algorithms behind Espalier please see:
 
-*Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests. 2022.*
+[Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests, Systematic Biology, 2023; syad040][paper-ref]
+
+[paper-ref]: <https://doi.org/10.1093/sysbio/syad040>
 
 ## Installation and set up
 

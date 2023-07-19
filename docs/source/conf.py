@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath('../../Espalier'))
 # -- Project information -----------------------------------------------------
 
 project = 'Espalier'
-copyright = '2021, David Rasmussen'
+copyright = '2021-2023, David Rasmussen'
 author = 'David Rasmussen'
 
 # The full version, including alpha/beta/rc tags

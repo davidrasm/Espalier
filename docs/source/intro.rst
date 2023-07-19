@@ -5,7 +5,7 @@ Espalier is a Python package for working with discordant phylogenetic trees usin
 
 For more information on the algorithms behind Espalier please see:
 
-*Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests. 2022.*
+`Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests, Systematic Biology, 2023; syad040 <https://doi.org/10.1093/sysbio/syad040>`_
 
 
 Motivation
@@ -25,7 +25,7 @@ However, discordance may also arise from errors or uncertainty in reconstructing
 
 Of course, in the presence of true topology-altering recombination events, the ancestral relationships among sampled individuals can no longer be represented by any single tree topology but rather requires a mosaic of phylogenetic histories. Ancestral recombination graphs (ARGs) provide an ideal way to capture this mosaic as a network of linked coalescent and recombination events. An ARG can also be thought of as a sequence of *local* trees representing the phylogenetic history over different regions of the genome with additional recombination nodes linking lineages that have undergone recombination between neighboring local trees.
 
-Espalier efficiently reconstructs approximate ARGs using (surprise!!) MAFs. Starting with an initial candidate local tree for each region of the genome, the iterative-regrafting algorithm is used to first reconcile discordances between neighboring local trees that are not strongly supported by the sequence data. Espalier then uses a dynamic programming approach based on the Viterbi algorithm to select a path of trees along the genome that maximizes the overall likelihood of the sequence data while minimizing discordance. After the tree path is chosen, MAFs are used yet again to identify the recombination events necessary to explain any remaining discordance between neighboring local trees and these events are inserted to obtain a fully connected ARG. While this approach is heuristic, Espalier performs very well at reconstructing ARGs even when compared against more exact but computationally expensive methods [RasmussenGuo2022]_.   
+Espalier efficiently reconstructs approximate ARGs using (surprise!!) MAFs. Starting with an initial candidate local tree for each region of the genome, the iterative-regrafting algorithm is used to first reconcile discordances between neighboring local trees that are not strongly supported by the sequence data. Espalier then uses a dynamic programming approach based on the Viterbi algorithm to select a path of trees along the genome that maximizes the overall likelihood of the sequence data while minimizing discordance. After the tree path is chosen, MAFs are used yet again to identify the recombination events necessary to explain any remaining discordance between neighboring local trees and these events are inserted to obtain a fully connected ARG. While this approach is heuristic, Espalier performs very well at reconstructing ARGs even when compared against more exact but computationally expensive methods [RasmussenGuo2023]_.   
 
 Installation/Usage
 ******************
@@ -67,4 +67,4 @@ These dependencies will be automatically installed by pip.
 
 Espalier also requires but is not packaged with RAxML-NG. Instructions for installing RAxML-NG can be found `here <https://github.com/amkozlov/raxml-ng>`_.
 
-.. [RasmussenGuo2022] Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests. 2022.
+.. [RasmussenGuo2023] Rasmussen, D.A. and Guo, F. Espalier: Efficient tree reconciliation and ARG reconstruction using maximum agreement forests, Systematic Biology, 2023; syad040.
