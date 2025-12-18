@@ -5,3 +5,5 @@ build/
 dist/
 Espalier.egg-info
 Espalier/__pycache__/
+/TestFiles
+*.pyc

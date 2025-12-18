@@ -70,7 +70,12 @@ class Reconciler(object):
         
         # Remove underscores from taxon names so compatible with dendropy taxon names
         #seq_dict = {record.id:record for record in my_records}
-        seq_dict = {record.id.replace('_',' '):record for record in my_records}
+        seq_dict = {}
+        for record in my_records:
+            k = record.id.strip()
+            seq_dict[k] = record
+            # backward compatibility: allow underscore→space lookups
+            seq_dict[k.replace("_", " ")] = record
         total_length = len(seq_dict[next(iter(seq_dict))].seq)
         
         # Assume entire align in seq_file is genomic region if start/end positions not given
