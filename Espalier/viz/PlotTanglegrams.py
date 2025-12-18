@@ -205,6 +205,9 @@ def convert2nexus(in_tree,out_tree,numerical_taxa_names=False):
     for idx,k in enumerate(myTree.Objects): ## iterate over a flat list of branches
         if k.branchType=='leaf':
             curr_name = k.numName
+            #Strip quotes if present
+            if len(curr_name) >= 2 and ((curr_name[0] == "'" and curr_name[-1] == "'") or (curr_name[0] == '"' and curr_name[-1] == '"')):
+                curr_name = curr_name[1:-1]
             names.append(curr_name)
     
     date_str = '' #'_2020.00'
@@ -235,8 +238,10 @@ def convert2nexus(in_tree,out_tree,numerical_taxa_names=False):
     with open(in_tree, 'r') as file:
         tree_str = file.read().replace('\n', '')
     if not numerical_taxa_names:
-        for idx,n in enumerate(names):
-            tree_str = re.sub(n, str(idx+1), tree_str) # if taxa names are non-numerical strings    
+        for idx, n in sorted(list(enumerate(names, start=1)), key=lambda x: len(x[1]), reverse=True):
+            pat = re.compile(rf"(?<=\(|,)['\"]?{re.escape(n)}['\"]?(?=[:),;])")
+            tree_str = pat.sub(str(idx), tree_str)
+            # tree_str = re.sub(n, str(idx+1), tree_str) # if taxa names are non-numerical strings    
     nex.write("tree TREE1 = " + tree_str + "\n")
     nex.write("End;\n")
 

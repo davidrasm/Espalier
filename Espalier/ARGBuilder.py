@@ -324,7 +324,7 @@ class ARGBuilder(object):
             
             # Get local tree for this segment"
             alt_file = local_tree_files[loc] # local tree
-            local_tree = dendropy.Tree.get(file=open(alt_file, 'r'), schema="newick", rooting="default-rooted", taxon_namespace=taxa)
+            local_tree = dendropy.Tree.get(file=open(alt_file, 'r'), schema="newick", rooting="default-rooted", taxon_namespace=taxa, preserve_underscores=True)
             #seq_file = seq_files[loc] # path + "disentangler_test1_tree" + str(loc) + ".fasta"
     
             # Get locally adapted consensus for previous segement
