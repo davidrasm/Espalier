@@ -47,22 +47,25 @@ class RAxMLRunner(object):
         self.lsd_path = kwargs.get('lsd_path', 'lsd')
 
     def get_tree_likelihood(self,tree_file,seq_file):
-        
+
         '''
             Compute log likelihood of sequnece alignment in seq_file given tree in tree_file
-         
-            Parameters:     
+
+            Parameters:
                tree_file (str): input newick tree file
                seq_file (str): input fasta file containing seq alignment
-               
+
             Returns:
                 logL (float): log likelihood of seq data given tree
         '''
-        
+
         logL = 0
-    
+
         temp_prefix = self.temp_dir + 'temp'
-        
+
+        # Sanitize tree to fix any negative branch lengths before passing to RAxML
+        tree_file = self._sanitize_tree_file(tree_file)
+
         # Evaluatae likelihood of seq data given tree in RAxML
         cmd_args = [self.raxml_path,
                     '--evaluate --msa', seq_file,
@@ -106,22 +109,25 @@ class RAxMLRunner(object):
         
         return logL
     
-    def get_site_likelihoods(self,tree_file,seq_file):   
-        
+    def get_site_likelihoods(self,tree_file,seq_file):
+
         """
             Compute per site log likelihoods of seq data given tree using raxml
             This allows site likes to be computed without optimization of model params or branch lengths
-            
-            Parameters:     
+
+            Parameters:
                tree_file (str): input newick tree file
                seq_file (str): input fasta file containing seq alignment
-               
+
             Returns:
                 site_likes (numpy.array): site-specific log likelihood of seq data given tree
-            
+
         """
-        
+
         temp_prefix = self.temp_dir + 'temp'
+
+        # Sanitize tree to fix any negative branch lengths before passing to RAxML
+        tree_file = self._sanitize_tree_file(tree_file)
 
         # Evaluatae likelihood of seq data given tree in RAxML
         cmd_args = [self.raxml_path,
@@ -169,17 +175,55 @@ class RAxMLRunner(object):
        
     
     def _parse_best_model(self,best_model_file):
-    
+
         """
             Parse model from *.raxml.bestModel output
-        """    
-    
+        """
+
         f = open(best_model_file)
         line = f.readline()
         f.close()
         model = line.split(',')[0]
-        
+
         return model
+
+    def _sanitize_tree_file(self, tree_file, min_branch_length=1e-9):
+        """
+            Sanitize tree file to fix negative or zero branch lengths.
+            RAxML-NG will fail if the tree contains negative branch lengths.
+
+            Parameters:
+                tree_file (str): input newick tree file
+                min_branch_length (float): minimum allowed branch length
+
+            Returns:
+                tree_file (str): path to sanitized tree file (may be same or new temp file)
+        """
+        try:
+            tree = dendropy.Tree.get(path=tree_file, schema="newick", rooting="default-rooted")
+
+            needs_fix = False
+            for edge in tree.postorder_edge_iter():
+                if edge.length is not None and edge.length < min_branch_length:
+                    needs_fix = True
+                    break
+
+            if needs_fix:
+                logging.debug(f"Fixing negative/zero branch lengths in {tree_file}")
+                for edge in tree.postorder_edge_iter():
+                    if edge.length is not None and edge.length < min_branch_length:
+                        edge.length = min_branch_length
+
+                # Write sanitized tree to a temp file
+                sanitized_file = self.temp_dir + 'temp_sanitized.tre'
+                tree.write(path=sanitized_file, schema='newick',
+                          suppress_annotations=True, suppress_rooting=True)
+                return sanitized_file
+
+        except Exception as e:
+            logging.warning(f"Could not sanitize tree file {tree_file}: {e}")
+
+        return tree_file
     
     
     def get_dated_raxml_tree(self,seq_file,tree_file,tip_date_file,rate_file,dirty=True,parse_model=True,root=True,outgroup_taxon=None):

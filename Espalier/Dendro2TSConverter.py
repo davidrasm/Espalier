@@ -63,7 +63,7 @@ def convert(tree_path,tree_intervals):
         
         # Get node df for next tree and merge node tables
         next_node_df, tree = tree2nodesdf(tree, prev_node_df=merged_node_df)
-        merged_node_df = merged_node_df.append(next_node_df,ignore_index=True)
+        merged_node_df = pd.concat([merged_node_df, next_node_df], ignore_index=True)
         merged_node_df.drop_duplicates(ignore_index=True,inplace=True)
         merged_node_df.sort_values('metadata', ignore_index=True, inplace=True) # first sort on metadata (sample/taxon labels)
         merged_node_df.sort_values('time', ignore_index=True, inplace=True) # then sort on times
@@ -79,7 +79,7 @@ def convert(tree_path,tree_intervals):
         
         # Get edge df for next trees and merge edge tables
         next_edge_df = tree2edgedf(tree,left_pos,right_pos,id_dict)
-        merged_edge_df = merged_edge_df.append(next_edge_df)
+        merged_edge_df = pd.concat([merged_edge_df, next_edge_df], ignore_index=True)
         
         # Check if we can assemble TableCollection and TreeSequence after each merger
         #merged_tables = df2TreeTables(merged_edge_df,merged_node_df,total_length)
@@ -227,9 +227,9 @@ def postorder_check(edges_df,nodes_df,tip_count):
                     # Add two addtional hidden rec nodes to nodes_df
                     time = nodes_df.at[nd_idx,'time'] + (nodes_df.at[recent_parent,'time'] - nodes_df.at[nd_idx,'time'])/2 # can just pick a random time between parent and child
                     new_rec_node = {'flags': 131072, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
-                    nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
+                    nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
                     left_recomb_parent = len(nodes_df.index) - 1
-                    nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
+                    nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
                     right_recomb_parent = len(nodes_df.index) - 1
                     deeper_parents.append(recent_parent) # need to include recent parent
                     for parent_nd in deeper_parents:
@@ -335,7 +335,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
                 time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_coal_time)/2 # can just pick a random time between parent and child
                 #time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_coal_time) * 0.01
                 new_coal_node = {'flags': 0, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
-                nodes_df = nodes_df.append(new_coal_node, ignore_index = True)
+                nodes_df = pd.concat([nodes_df, pd.DataFrame([new_coal_node])], ignore_index=True)
                 new_node_index = len(nodes_df.index) - 1
                 
                 for child_nd in changing_children:
@@ -410,11 +410,11 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
 
         if len(children) == 0: # node is a sampled tip
             flags = tskit.NODE_IS_SAMPLE
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':int(node.taxon.label), 'unique_id':unique_id},ignore_index=True)
+            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':int(node.taxon.label), 'unique_id':unique_id}])], ignore_index=True)
             node.unique_id = unique_id
         elif len(children) == 1: # node is recombination event
             flags = 131072 #recomb_flag
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id},ignore_index=True)
+            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id}])], ignore_index=True)
             node.unique_id = recomb_id
             recomb_id -= 1 # decrement recombinant node unique id counter
         else: # Coalescent node
@@ -435,9 +435,9 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
                 if not coal_time_duplicates.empty:
                     unique_id = coal_time_duplicates.iloc[0].unique_id
                 
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id},ignore_index=True)
+            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id}])], ignore_index=True)
             node.unique_id = unique_id
-    
+
     return nodes_df, tree                 
 
 def tree2edgedf(tree,left,right,id_dict):
@@ -446,14 +446,15 @@ def tree2edgedf(tree,left,right,id_dict):
         Converts tree into edges dataframe compatible with ts.tables.edges.
     """   
     
-    edges_df = pd.DataFrame(columns=['left', 'right', 'parent', 'child','parent_unique_id','child_unique_id'])
+    edge_rows = []
     for node in tree.ageorder_node_iter():
         children = list(node.child_nodes())
         parent_id = id_dict[node.unique_id]
         for child in children:
             child_id = id_dict[child.unique_id]
-            edges_df = edges_df.append({'left':left, 'right':right, 'parent':parent_id, 'child':child_id, 'parent_unique_id':node.unique_id, 'child_unique_id':child.unique_id}, ignore_index=True)
-                    
+            edge_rows.append({'left':left, 'right':right, 'parent':parent_id, 'child':child_id, 'parent_unique_id':node.unique_id, 'child_unique_id':child.unique_id})
+    edges_df = pd.DataFrame(edge_rows, columns=['left', 'right', 'parent', 'child','parent_unique_id','child_unique_id'])
+
     return edges_df     
 
 
@@ -553,8 +554,8 @@ def split_edge(edges_df,parent_nd,split_nd,child_nd):
     
         edges_df.loc[edge_idx,'parent'] = split_nd # replace old parent with split node
         new_parent_edge = {'left': edge.left, 'right': edge.right, 'parent': parent_nd, 'child': split_nd} # add extra edge for old parent and split node
-        edges_df = edges_df.append(new_parent_edge, ignore_index = True)
-    
+        edges_df = pd.concat([edges_df, pd.DataFrame([new_parent_edge])], ignore_index=True)
+
     edges_df = edges_df.astype({"parent": int, "child": int}) # wish we didn't have to do this!
     return edges_df
 
@@ -575,8 +576,8 @@ def split_edge_on_rec(edges_df,parent_nd,child_nd,left_recomb_parent,right_recom
     
         edges_df.loc[edge_idx,'parent'] = rec_node # replace old parent with split node
         new_parent_edge = {'left': edge.left, 'right': edge.right, 'parent': parent_nd, 'child': rec_node} # add extra edge for old parent and split node
-        edges_df = edges_df.append(new_parent_edge, ignore_index = True)
-    
+        edges_df = pd.concat([edges_df, pd.DataFrame([new_parent_edge])], ignore_index=True)
+
     edges_df = edges_df.astype({"parent": int, "child": int}) # wish we didn't have to do this!
     return edges_df
 

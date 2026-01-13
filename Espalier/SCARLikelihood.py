@@ -46,7 +46,7 @@ class SCAR(object):
         self.genome_length = genome_length
         
         # Likelihood calculation params
-        self.bounds = kwargs.get('bounds', (0,np.Inf))
+        self.bounds = kwargs.get('bounds', (0, np.inf))
         self.dt_step = kwargs.get('dt_step', 0.1)
         self.known_ancestral_states = kwargs.get('known_ancestral_states', False)
         
