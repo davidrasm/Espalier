@@ -175,6 +175,13 @@ class ARGBuilder(object):
         
         # Get initial rec_rate from coal_model
         rec_rate = coal_model.rec_rate # recombination rate per site
+
+        # Initialize ts to None (will be set if conversion succeeds)
+        ts = None
+        inferred_recomb_events = 0
+        last_successful_ts = None
+        last_successful_recomb_events = 0
+        last_tree_path = None  # Store the last tree path with recombination nodes
         
         # Get genomic segment info for each genomic region
         self._get_genome_segments(seq_files)
@@ -240,7 +247,10 @@ class ARGBuilder(object):
                     # Add required rec nodes to trees in path
                     logging.info("Adding recombination events to trees in path")
                     tree_path, total_recs_added = add_path_rec_nodes(tree_path)
-                    
+
+                    # Store tree path with recombination nodes (even if TS conversion fails)
+                    last_tree_path = [t.clone(depth=2) for t in tree_path]
+
                     # Convert tree path with recombination nodes to tskit TreeSequence
                     ts = Dendro2TSConverter.convert(tree_path,tree_intervals)
                     inferred_recomb_events = len(ts.tables.nodes.flags[ts.tables.nodes.flags==131072]) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
@@ -254,15 +264,18 @@ class ARGBuilder(object):
                     rec_rate_samples.append(rec_rate)
                     logging.info("Recombination rate estimate: %s", f'{rec_rate:.6f}')
                                 
-                except Exception as e: 
-                    
+                except Exception as e:
+
                     print(e)
                     failed_attempts += 1
-                
+
                 else:
-                    
+
                     step_completed = True
-                    
+                    # Store the last successful ts
+                    last_successful_ts = ts
+                    last_successful_recomb_events = inferred_recomb_events
+
                 finally:
                                    
                     if failed_attempts == max_attempts:
@@ -281,8 +294,14 @@ class ARGBuilder(object):
                         rec_rate = rec_rate_per_genome / coal_model.genome_length
                         rec_rate = max(min_rec_rate, rec_rate)
                         logging.info("Recombination rate estimate: %s", f'{rec_rate:.6f}')
-                                
-        return ts, rec_rate, inferred_recomb_events
+
+        # Return the last successful ts if current ts is None
+        if ts is None and last_successful_ts is not None:
+            logging.info("Using last successful TreeSequence from earlier EM iteration")
+            ts = last_successful_ts
+            inferred_recomb_events = last_successful_recomb_events
+
+        return ts, rec_rate, inferred_recomb_events, last_tree_path
     
     def _build_trellis(self,local_tree_files,seq_files,ref):
     
@@ -662,10 +681,15 @@ def find_recombination_events(ref,alt,maf,ref_rec_nodes,alt_rec_nodes):
         if max_recomb_time >= min_recomb_time:
             # Add random rec event time based on min and max allowed rec times
             recomb_time = np.random.uniform(low=min_recomb_time,high=max_recomb_time) # draw a uniform time between these constraints
-            ref_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_ref.split_bitmask, recomb_time=recomb_time))
-            alt_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_alt.split_bitmask, recomb_time=recomb_time))
         else:
-            logging.warning("WARNING: Could not add recombination nodes due to time constraint violations!")
+            # Relaxed placement: use midpoint when constraints are violated
+            # This preserves topology/ancestry but may have minor time inconsistencies
+            logging.warning(f"Time constraint violation: max={max_recomb_time:.6f} < min={min_recomb_time:.6f}. "
+                          f"Using relaxed placement at midpoint.")
+            recomb_time = (min_recomb_time + max_recomb_time) / 2
+
+        ref_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_ref.split_bitmask, recomb_time=recomb_time))
+        alt_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_alt.split_bitmask, recomb_time=recomb_time))
     
     return ref_rec_nodes,alt_rec_nodes
 

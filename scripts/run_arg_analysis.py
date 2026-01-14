@@ -180,7 +180,7 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
     logger.info(f"  Initial recombination rate: {scar_model.rec_rate:.2e}")
     logger.info(f"  Running {em_iters} EM iterations...")
 
-    ts, rec_rate_est, n_recomb = argb.run_EM(
+    ts, rec_rate_est, n_recomb, tree_path_with_recs = argb.run_EM(
         ml_tree_files,
         seq_files,
         ref,
@@ -191,10 +191,29 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
     logger.info(f"  Final estimated recombination rate: {rec_rate_est:.6f} per site")
     logger.info(f"  Inferred recombination events: {int(n_recomb)}")
 
-    # Save TreeSequence
-    ts_file = os.path.join(output_dir, 'arg_treesequence.trees')
-    ts.dump(ts_file)
-    logger.info(f"  TreeSequence saved: {ts_file}")
+    # Save trees with recombination nodes (even if TreeSequence conversion fails)
+    if tree_path_with_recs is not None:
+        logger.info("  Saving ARG trees with recombination nodes...")
+        for idx, tree in enumerate(tree_path_with_recs):
+            seg_name = os.path.basename(seq_files[idx]).replace('.fasta', '').replace('_aligned_common', '')
+            tree_file = os.path.join(output_dir, f'{seg_name}_ARG_with_recomb.tre')
+            tree.write(path=tree_file, schema='newick', suppress_annotations=True, suppress_rooting=True)
+            logger.info(f"    -> {tree_file}")
+
+            # Count recombination nodes (unifurcations) in the tree
+            n_rec_nodes = sum(1 for node in tree.preorder_node_iter() if len(node.child_nodes()) == 1 and node.parent_node is not None)
+            logger.info(f"       Recombination nodes in {seg_name}: {n_rec_nodes}")
+
+    # Save TreeSequence if available
+    if ts is not None:
+        ts_file = os.path.join(output_dir, 'arg_treesequence.trees')
+        ts.dump(ts_file)
+        logger.info(f"  TreeSequence saved: {ts_file}")
+    else:
+        logger.warning("  TreeSequence conversion failed - no .trees file saved")
+        # Don't raise - we still have the trees with recombination nodes
+        if tree_path_with_recs is None:
+            raise ValueError("TreeSequence conversion failed and no tree path available")
 
     return ts, rec_rate_est, n_recomb
 
