@@ -106,29 +106,6 @@ Framework for comparing original vs. modernized implementations:
 
 ---
 
-## Configuration & Documentation
-
-### 11. Environment Specification
-**File:** `environment.yml`
-
-- Added conda environment file with pinned dependencies
-- Ensures reproducible installation
-
-### 12. Updated Documentation Links
-**Files:** `README.md`, `setup.py`, `docs/source/conf.py`, `docs/source/intro.rst`
-
-- Updated repository URLs to fork location
-- Updated paper reference
-
-### 13. Gitignore Updates
-**File:** `.gitignore`
-
-- Added patterns for test outputs (`TestFiles/Outputs/`, `arg_output_*/`)
-- Added `*.trees` for TreeSequence files
-- Prevents large output files from being committed
-
----
-
 ## Files Modified
 
 | File | Changes |
