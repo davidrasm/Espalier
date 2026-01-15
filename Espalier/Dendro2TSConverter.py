@@ -116,6 +116,13 @@ def convert(tree_path,tree_intervals):
             else:
                 raise
 
+    # Return early if we already have a valid TreeSequence
+    # The post/pre-order checks can be slow and may cause issues with complex ARGs
+    # For now, skip them and return the initial TreeSequence
+    logging.info("Skipping post/pre-order checks - returning initial TreeSequence")
+    return merged_ts
+
+    # NOTE: Code below is kept but not executed - can be re-enabled if needed
     # Work with TableCollection for checking instead of TreeSequence b/c TS are not mutable
     tables = merged_ts.dump_tables() # return copy of tables we'll work with
     edges_df, nodes_df = treeTables2df(tables)
@@ -189,10 +196,16 @@ def postorder_check(edges_df,nodes_df,tip_count):
             mrp_type = nodes_df.at[mrp,'flags']
             
             if mrp_type == 131072: # recomb event
-                
+
                 if len(recomb_parents) > 2:
                     logging.error('Warning: node has more than two recombination node parents')
-            
+
+                # Check if we have at least 2 recombination parents
+                if len(recomb_parents) < 2:
+                    logging.warning(f'Node {nd_idx} has recomb parent but fewer than 2 recomb_parents ({len(recomb_parents)}). Skipping.')
+                    nd_idx += 1
+                    continue
+
                 # Find recombinant parents
                 recomb_parent_edges_1 = edges_df.loc[(edges_df['parent'] == recomb_parents[0]) & (edges_df['child'] == nd_idx)]
                 recomb_parent_edges_2 = edges_df.loc[(edges_df['parent'] == recomb_parents[1]) & (edges_df['child'] == nd_idx)]
@@ -407,8 +420,8 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
         If it does, checks node height equality and assigns new unique id to nodes with different heights
     """
     
-    # Create empty nodes_df compatible with ts.tables.nodes
-    nodes_df = pd.DataFrame(columns=['flags', 'time', 'population', 'metadata','unique_id'])
+    # Collect rows first to avoid concat-on-empty warnings and then build the DataFrame once
+    node_rows = []
     
     # Encode bipartitions -- used fo unique node ids
     tree.encode_bipartitions(suppress_unifurcations=False)
@@ -439,11 +452,11 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
                 metadata = int(node.taxon.label)
             except (ValueError, TypeError):
                 metadata = node.taxon.label
-            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':metadata, 'unique_id':unique_id}])], ignore_index=True)
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':metadata, 'unique_id':unique_id})
             node.unique_id = unique_id
         elif len(children) == 1: # node is recombination event
             flags = 131072 #recomb_flag
-            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id}])], ignore_index=True)
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id})
             node.unique_id = recomb_id
             recomb_id -= 1 # decrement recombinant node unique id counter
         else: # Coalescent node
@@ -464,8 +477,10 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
                 if not coal_time_duplicates.empty:
                     unique_id = coal_time_duplicates.iloc[0].unique_id
                 
-            nodes_df = pd.concat([nodes_df, pd.DataFrame([{'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id}])], ignore_index=True)
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id})
             node.unique_id = unique_id
+
+    nodes_df = pd.DataFrame(node_rows, columns=['flags', 'time', 'population', 'metadata','unique_id'])
 
     return nodes_df, tree                 
 

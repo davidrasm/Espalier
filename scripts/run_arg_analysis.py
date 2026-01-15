@@ -43,11 +43,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def setup_directories(base_dir):
-    """Create output and temp directories."""
+def setup_directories(base_dir, output_base=None):
+    """Create output and temp directories.
+
+    Parameters:
+        base_dir: Base directory of the project
+        output_base: Base directory for outputs (default: TestFiles/Outputs)
+
+    Returns:
+        output_dir: Timestamped output directory
+        temp_dir: Temp directory within output_dir
+    """
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
 
-    output_dir = os.path.join(base_dir, f'arg_output_{timestamp}')
+    if output_base is None:
+        output_base = os.path.join(base_dir, 'TestFiles', 'Outputs')
+
+    os.makedirs(output_base, exist_ok=True)
+
+    output_dir = os.path.join(output_base, f'arg_output_{timestamp}')
     temp_dir = os.path.join(output_dir, 'temp')
 
     os.makedirs(output_dir, exist_ok=True)
