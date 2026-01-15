@@ -11,7 +11,7 @@ Key improvements:
 4. tskit constants instead of magic numbers
 5. Systematic use of tables.sort()
 
-Author: A/B Testing Framework
+Author: Ricardo Rivero
 """
 
 import tskit

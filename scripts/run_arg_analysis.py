@@ -13,13 +13,21 @@ For reassortment analysis (e.g., segmented viruses), each segment file
 represents a breakpoint boundary.
 
 Usage:
+    # Default (Hantavirus test data):
     python run_arg_analysis.py
+
+    # Custom dataset:
+    python run_arg_analysis.py --alignments TestFiles/FluTest/alignments --trees TestFiles/FluTest/trees
+
+    # With custom parameters:
+    python run_arg_analysis.py --alignments /path/to/alignments --trees /path/to/trees --em-iters 10 --rec-rate 1e-5
 
 Author: Generated for Espalier analysis
 """
 
 import os
 import sys
+import argparse
 import datetime
 import shutil
 import logging
@@ -28,12 +36,21 @@ import dendropy
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add scripts directory for ab_testing module
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from Espalier.ARGBuilder import ARGBuilder
 from Espalier.Reconciler import Reconciler
 from Espalier.RAxML import RAxMLRunner
 from Espalier.SCARLikelihood import SCAR
 from Espalier import Utils
+
+# Modern converter for improved TreeSequence conversion
+try:
+    from ab_testing.modern_converter import convert_modern, ConversionMetrics
+    MODERN_CONVERTER_AVAILABLE = True
+except ImportError:
+    MODERN_CONVERTER_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -170,7 +187,7 @@ def reconstruct_arg_basic(argb, ml_tree_files, seq_files, ref, rec_rate, output_
     return tree_path, arg_tree_files
 
 
-def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_dir, em_iters=10):
+def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_dir, em_iters=10, use_modern_converter=False):
     """
     Run EM algorithm for joint ARG reconstruction and recombination rate estimation.
 
@@ -182,6 +199,7 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
         scar_model: SCAR coalescent model
         output_dir: Output directory
         em_iters: Number of EM iterations
+        use_modern_converter: Use the modernized TreeSequence converter
 
     Returns:
         ts: TreeSequence with full ARG
@@ -193,6 +211,8 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
     logger.info("=" * 60)
     logger.info(f"  Initial recombination rate: {scar_model.rec_rate:.2e}")
     logger.info(f"  Running {em_iters} EM iterations...")
+    if use_modern_converter:
+        logger.info("  Using MODERN converter (3x faster, more robust)")
 
     ts, rec_rate_est, n_recomb, tree_path_with_recs = argb.run_EM(
         ml_tree_files,
@@ -209,7 +229,7 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
     if tree_path_with_recs is not None:
         logger.info("  Saving ARG trees with recombination nodes...")
         for idx, tree in enumerate(tree_path_with_recs):
-            seg_name = os.path.basename(seq_files[idx]).replace('.fasta', '').replace('_aligned_common', '')
+            seg_name = os.path.basename(seq_files[idx]).replace('.fasta', '').replace('_aligned_common', '').replace('.aln', '')
             tree_file = os.path.join(output_dir, f'{seg_name}_ARG_with_recomb.tre')
             tree.write(path=tree_file, schema='newick', suppress_annotations=True, suppress_rooting=True)
             logger.info(f"    -> {tree_file}")
@@ -217,6 +237,25 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
             # Count recombination nodes (unifurcations) in the tree
             n_rec_nodes = sum(1 for node in tree.preorder_node_iter() if len(node.child_nodes()) == 1 and node.parent_node is not None)
             logger.info(f"       Recombination nodes in {seg_name}: {n_rec_nodes}")
+
+    # Try modern converter if requested and original failed or for better performance
+    if use_modern_converter and MODERN_CONVERTER_AVAILABLE and tree_path_with_recs is not None:
+        logger.info("  Converting tree path using modern converter...")
+        from Bio import SeqIO
+        tree_intervals = []
+        cumulative = 0
+        for sf in seq_files:
+            seq_length = len(list(SeqIO.parse(sf, "fasta"))[0])
+            tree_intervals.append((cumulative, cumulative + seq_length))
+            cumulative += seq_length
+
+        try:
+            ts, metrics = convert_modern(tree_path_with_recs, tree_intervals)
+            logger.info(f"  Modern converter: {metrics.n_nodes} nodes, {metrics.n_edges} edges, "
+                       f"{metrics.n_recomb_nodes} recomb nodes in {metrics.total_time:.3f}s")
+        except Exception as e:
+            logger.warning(f"  Modern converter failed: {e}")
+            logger.info("  Falling back to original TreeSequence if available")
 
     # Save TreeSequence if available
     if ts is not None:
@@ -363,35 +402,86 @@ def map_recombinations_to_segments(recomb_info, seq_files):
     return segment_boundaries, segment_names
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Espalier ARG Reconstruction and Recombination Rate Estimation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Default (Hantavirus test data):
+  python run_arg_analysis.py
+
+  # Flu dataset:
+  python run_arg_analysis.py --alignments TestFiles/FluTest/alignments --trees TestFiles/FluTest/trees
+
+  # Custom parameters:
+  python run_arg_analysis.py --alignments /path/to/aln --trees /path/to/trees --em-iters 10
+        """
+    )
+
+    parser.add_argument('--alignments', '-a', type=str, default=None,
+                        help='Directory containing alignment files (.fasta or .aln)')
+    parser.add_argument('--trees', '-t', type=str, default=None,
+                        help='Directory containing pre-computed tree files (.tre)')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Output directory (default: TestFiles/Outputs/arg_output_TIMESTAMP)')
+    parser.add_argument('--rec-rate', type=float, default=1e-4,
+                        help='Initial recombination rate per site (default: 1e-4)')
+    parser.add_argument('--em-iters', type=int, default=5,
+                        help='Number of EM iterations (default: 5)')
+    parser.add_argument('--ne', type=float, default=1.0,
+                        help='Effective population size in coalescent units (default: 1.0)')
+    parser.add_argument('--raxml-path', type=str, default='raxml-ng',
+                        help='Path to raxml-ng executable (default: raxml-ng)')
+    parser.add_argument('--skip-em', action='store_true',
+                        help='Skip EM estimation, only run basic ARG reconstruction')
+    parser.add_argument('--use-modern-converter', action='store_true',
+                        help='Use the modernized TreeSequence converter (3x faster, more robust)')
+
+    return parser.parse_args()
+
+
 def main():
     """Main analysis pipeline."""
 
+    args = parse_args()
+
     # Configuration
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ALIGNMENT_DIR = os.path.join(BASE_DIR, 'TestFiles', 'alignments')
-    TREE_DIR = os.path.join(BASE_DIR, 'TestFiles', 'trees')
+
+    # Set alignment and tree directories
+    if args.alignments:
+        ALIGNMENT_DIR = args.alignments if os.path.isabs(args.alignments) else os.path.join(BASE_DIR, args.alignments)
+    else:
+        ALIGNMENT_DIR = os.path.join(BASE_DIR, 'TestFiles', 'alignments')
+
+    if args.trees:
+        TREE_DIR = args.trees if os.path.isabs(args.trees) else os.path.join(BASE_DIR, args.trees)
+    else:
+        TREE_DIR = os.path.join(BASE_DIR, 'TestFiles', 'trees')
 
     # Analysis parameters
-    INITIAL_REC_RATE = 1e-4  # Initial guess for recombination rate per site
-    EM_ITERATIONS = 5        # Number of EM iterations
-    NE = 1.0                 # Effective population size (coalescent units)
-
-    # RAxML-NG path (adjust if needed)
-    RAXML_PATH = 'raxml-ng'
+    INITIAL_REC_RATE = args.rec_rate
+    EM_ITERATIONS = args.em_iters
+    NE = args.ne
+    RAXML_PATH = args.raxml_path
 
     logger.info("=" * 60)
     logger.info("Espalier ARG Analysis Pipeline")
     logger.info("=" * 60)
 
     # Setup directories
-    output_dir, temp_dir = setup_directories(BASE_DIR)
+    output_dir, temp_dir = setup_directories(BASE_DIR, args.output)
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Alignment directory: {ALIGNMENT_DIR}")
+    logger.info(f"Tree directory: {TREE_DIR}")
 
-    # Get sequence files (ordered by segment: S, M, L)
+    # Get sequence files - support both .fasta and .aln extensions
     seq_files = sorted([
         os.path.join(ALIGNMENT_DIR, f)
         for f in os.listdir(ALIGNMENT_DIR)
-        if f.endswith('.fasta')
+        if f.endswith('.fasta') or f.endswith('.aln')
     ])
 
     logger.info(f"\nInput alignments ({len(seq_files)} segments):")
@@ -407,19 +497,49 @@ def main():
     logger.info(f"\nTotal genome length: {genome_length} bp")
 
     # Check if pre-computed trees exist
+    # Try multiple naming conventions to match alignment files to tree files
+    def find_matching_tree(seq_file, tree_dir):
+        """Find a tree file matching the alignment file."""
+        base = os.path.basename(seq_file)
+        # Try various naming patterns
+        patterns = [
+            # Exact match with .tre extension
+            base + '.tre',
+            base + '.rooted.tre',
+            # Remove .fasta/.aln and add .tre
+            base.replace('.fasta', '.tre').replace('.aln', '.tre'),
+            base.replace('.fasta', '.rooted.tre').replace('.aln', '.rooted.tre'),
+            # Hantavirus convention
+            base.replace('_aligned_common.fasta', '_tree_common_binary.tre'),
+            base.replace('_aligned_common.fasta', '_tree_common.tre'),
+        ]
+
+        for pattern in patterns:
+            tree_file = os.path.join(tree_dir, pattern)
+            if os.path.exists(tree_file):
+                return tree_file
+
+        # Also try finding any tree that starts with the same prefix
+        prefix = base.split('.')[0]  # e.g., "HA-swine_H1_HANA" from "HA-swine_H1_HANA.fasta.aln"
+        for f in os.listdir(tree_dir):
+            if f.startswith(prefix) and f.endswith('.tre'):
+                return os.path.join(tree_dir, f)
+
+        return None
+
     use_precomputed = True
     precomputed_trees = []
     for sf in seq_files:
-        seg_name = os.path.basename(sf).replace('_aligned_common.fasta', '')
-        tree_file = os.path.join(TREE_DIR, f'{seg_name}_tree_common_binary.tre')
-        if os.path.exists(tree_file):
+        tree_file = find_matching_tree(sf, TREE_DIR)
+        if tree_file:
             precomputed_trees.append(tree_file)
         else:
             use_precomputed = False
+            logger.warning(f"No matching tree found for: {os.path.basename(sf)}")
             break
 
     if use_precomputed and len(precomputed_trees) == len(seq_files):
-        logger.info("\nUsing pre-computed trees from TestFiles/trees/")
+        logger.info(f"\nUsing pre-computed trees from {TREE_DIR}")
         ml_tree_files = precomputed_trees
         for tf in ml_tree_files:
             logger.info(f"  - {os.path.basename(tf)}")
@@ -429,18 +549,7 @@ def main():
             ml_tree_files = infer_ml_trees(seq_files, output_dir, temp_dir, RAXML_PATH)
         except Exception as e:
             logger.error(f"RAxML-NG failed: {e}")
-            logger.info("Falling back to pre-computed trees if available...")
-            # Try to use any available pre-computed trees
-            ml_tree_files = []
-            for sf in seq_files:
-                seg_name = os.path.basename(sf).replace('_aligned_common.fasta', '')
-                for pattern in ['_tree_common_binary.tre', '_tree_common.tre']:
-                    tree_file = os.path.join(TREE_DIR, f'{seg_name}{pattern}')
-                    if os.path.exists(tree_file):
-                        ml_tree_files.append(tree_file)
-                        break
-            if len(ml_tree_files) != len(seq_files):
-                raise RuntimeError("Could not find trees for all segments")
+            raise RuntimeError(f"Could not find or infer trees for all segments: {e}")
 
     # Build consensus reference tree
     ref = get_reference_tree(ml_tree_files, output_dir)
@@ -457,33 +566,40 @@ def main():
         argb, ml_tree_files, seq_files, ref, INITIAL_REC_RATE, output_dir
     )
 
-    # EM-based rate estimation
-    logger.info("\nInitializing SCAR coalescent model...")
-    scar_model = SCAR(
-        rec_rate=INITIAL_REC_RATE,
-        M=[[0]],  # Single population (no migration)
-        Ne=NE,
-        genome_length=genome_length,
-        bounds=(0, 0.01)  # Reasonable bounds for rec rate
-    )
+    # EM-based rate estimation (optional)
+    ts = None
+    rec_rate_est = INITIAL_REC_RATE
+    n_recomb = 0
 
-    try:
-        ts, rec_rate_est, n_recomb = run_em_estimation(
-            argb, ml_tree_files, seq_files, ref, scar_model, output_dir, EM_ITERATIONS
+    if args.skip_em:
+        logger.info("\nSkipping EM estimation (--skip-em flag set)")
+    else:
+        logger.info("\nInitializing SCAR coalescent model...")
+        scar_model = SCAR(
+            rec_rate=INITIAL_REC_RATE,
+            M=[[0]],  # Single population (no migration)
+            Ne=NE,
+            genome_length=genome_length,
+            bounds=(0, 0.01)  # Reasonable bounds for rec rate
         )
 
-        # Extract recombination information
-        recomb_info = extract_recombination_info(ts, seq_files, output_dir)
+        try:
+            ts, rec_rate_est, n_recomb = run_em_estimation(
+                argb, ml_tree_files, seq_files, ref, scar_model, output_dir, EM_ITERATIONS,
+                use_modern_converter=args.use_modern_converter
+            )
 
-        # Map to segment boundaries (for reassortment)
-        segment_boundaries, segment_names = map_recombinations_to_segments(recomb_info, seq_files)
+            # Extract recombination information
+            recomb_info = extract_recombination_info(ts, seq_files, output_dir)
 
-    except Exception as e:
-        logger.error(f"EM estimation failed: {e}")
-        logger.info("Continuing with basic ARG reconstruction results...")
-        ts = None
-        rec_rate_est = INITIAL_REC_RATE
-        n_recomb = 0
+            # Map to segment boundaries (for reassortment)
+            segment_boundaries, segment_names = map_recombinations_to_segments(recomb_info, seq_files)
+
+        except Exception as e:
+            logger.error(f"EM estimation failed: {e}")
+            logger.info("Continuing with basic ARG reconstruction results...")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     # Final summary
     logger.info("\n" + "=" * 60)

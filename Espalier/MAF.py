@@ -56,31 +56,94 @@ def get_maf_4cut(ref_in,alt_in,plot=False):
     
     # Check for discordance between trees
     discordant = _update_concordance(alt,ref_bipartition_dict)
-        
+
     # Run MAF algorithm
     forest = dendropy.TreeList() # forest to hold subtrees in MAF
     counter = 0
-    while discordant:
-                    
+    max_iterations = 10000  # Safety limit for very large trees
+    while discordant and counter < max_iterations:
+
         # Find first discordant edge
+        discordant_edge = None
         for edge in alt.postorder_edge_iter():
-            if not edge.concordant: break
-            
-        parent = edge.head_node #first discordant sibling pair (edge) in t1
+            if not edge.concordant:
+                discordant_edge = edge
+                break
+
+        # If no discordant edge found, we're done
+        if discordant_edge is None:
+            break
+
+        parent = discordant_edge.head_node #first discordant sibling pair (edge) in t1
         edge_cut_list = parent.child_edges()
-        
+
+        # Handle case where parent has no children (leaf node or unifurcation)
+        if len(edge_cut_list) < 2:
+            # Use the discordant edge itself as the cut point
+            if discordant_edge.tail_node is not None and discordant_edge not in edge_cut_list:
+                edge_cut_list = [discordant_edge]
+            if len(edge_cut_list) == 0:
+                # Can't find valid cut - mark as concordant and continue
+                discordant_edge.concordant = True
+                ref_bipartition_dict = ref.split_bitmask_edge_map
+                discordant = _update_concordance(alt, ref_bipartition_dict)
+                counter += 1
+                continue
+
         # Update edge bipartition dicts
         ref_bipartition_dict = ref.split_bitmask_edge_map
         alt_bipartition_dict = alt.split_bitmask_edge_map
-        
+
         # Get sibling of A and C in ALT
+        if len(edge_cut_list) < 2:
+            # Single edge - skip sibling finding, just cut this edge
+            counter += 1
+            # Extract and prune the single edge
+            alt_cut = alt.clone(depth=2)
+            ref_cut = ref.clone(depth=2)
+            alt_cut_bipartition_dict = alt_cut.split_bitmask_edge_map
+            ref_cut_bipartition_dict = ref_cut.split_bitmask_edge_map
+            edge = edge_cut_list[0]
+            bitmask = edge.leafset_bitmask
+            alt_cut_edge = alt_cut_bipartition_dict.get(bitmask, None)
+            ref_cut_edge = ref_cut_bipartition_dict.get(bitmask, None)
+
+            if alt_cut_edge is None or ref_cut_edge is None:
+                discordant_edge.concordant = True
+                discordant = _update_concordance(alt, ref_bipartition_dict)
+                continue
+
+            child_nd = alt_cut_edge.head_node
+            component = TreeOps.extract_subtree(alt_cut, child_nd)
+            forest.append(component)
+            alt_cut.prune_subtree(child_nd, update_bipartitions=True, suppress_unifurcations=True)
+            ref_cut_child = ref_cut_edge.head_node
+            ref_cut.prune_subtree(ref_cut_child, update_bipartitions=True, suppress_unifurcations=True)
+            alt = alt_cut
+            ref = ref_cut
+            ref_bipartition_dict = ref.split_bitmask_edge_map
+            discordant = _update_concordance(alt, ref_bipartition_dict)
+            continue
+
         edge_A = edge_cut_list[0]
         edge_C = edge_cut_list[1]
-        
-        # Get sibling edge B 
+
+        # Get sibling edge B
         ref_edge_A = ref_bipartition_dict.get(edge_A.leafset_bitmask,None)
+        if ref_edge_A is None:
+            # Edge A not found in ref - skip this iteration
+            discordant_edge.concordant = True
+            discordant = _update_concordance(alt, ref_bipartition_dict)
+            counter += 1
+            continue
         parent_edge_A = ref_edge_A.tail_node
         child_edges = parent_edge_A.child_edges()
+        if len(child_edges) < 2:
+            # Not enough children - skip
+            discordant_edge.concordant = True
+            discordant = _update_concordance(alt, ref_bipartition_dict)
+            counter += 1
+            continue
         if child_edges[0] is ref_edge_A:
             sibling_edge = child_edges[1]
         else:
@@ -88,18 +151,20 @@ def get_maf_4cut(ref_in,alt_in,plot=False):
         alt_edge_B = alt_bipartition_dict.get(sibling_edge.leafset_bitmask,None)
         if alt_edge_B:
             edge_cut_list.append(alt_edge_B)
-        
+
         # Get sibling edge D
         ref_edge_C = ref_bipartition_dict.get(edge_C.leafset_bitmask,None)
-        parent_edge_C = ref_edge_C.tail_node
-        child_edges = parent_edge_C.child_edges()
-        if child_edges[0] is ref_edge_C:
-            sibling_edge = child_edges[1]
-        else:
-            sibling_edge = child_edges[0]
-        alt_edge_D = alt_bipartition_dict.get(sibling_edge.leafset_bitmask,None)
-        if alt_edge_D:
-            edge_cut_list.append(alt_edge_D)
+        if ref_edge_C is not None and ref_edge_C.tail_node is not None:
+            parent_edge_C = ref_edge_C.tail_node
+            child_edges = parent_edge_C.child_edges()
+            if len(child_edges) >= 2:
+                if child_edges[0] is ref_edge_C:
+                    sibling_edge = child_edges[1]
+                else:
+                    sibling_edge = child_edges[0]
+                alt_edge_D = alt_bipartition_dict.get(sibling_edge.leafset_bitmask,None)
+                if alt_edge_D:
+                    edge_cut_list.append(alt_edge_D)
         
         # Cut each edge in edge_cut_list and determine which minimizes discordance"
         D = [] # array to hold discordance metric

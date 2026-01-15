@@ -15,3 +15,5 @@ arg_output_*/
 /TestFiles/alignments
 /scripts/ab_testing/Outputs
 scripts/ab_testing/generate_results_pdf.py
+/TestFiles/FluTest
+/TestFiles/FluTest_subsampled
