@@ -13,6 +13,7 @@
 import dendropy
 from Bio import AlignIO
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 from dendropy.calculate import treecompare
 
 """
@@ -88,13 +89,35 @@ def concate_aligns(seq_files,file_out):
     
     """
 
+    concat_seqs = None
+    expected_taxa = None
     for idx, file in enumerate(seq_files):
-        seq_dict = SeqIO.to_dict(SeqIO.parse(file, "fasta")) # one line alternative
+        seq_dict = {}
+        for record in SeqIO.parse(file, "fasta"):
+            key = record.id.strip()
+            if key in seq_dict:
+                raise ValueError(f"Duplicate sequence id '{key}' found in {file}")
+            seq_dict[key] = SeqRecord(record.seq, id=key, name=key, description=key)
         if idx == 0:
             concat_seqs = seq_dict
-        else:
-            for key in concat_seqs:
-                concat_seqs[key] += seq_dict[key]            
+            expected_taxa = set(seq_dict)
+            continue
+
+        seq_taxa = set(seq_dict)
+        missing = sorted(expected_taxa - seq_taxa)
+        extra = sorted(seq_taxa - expected_taxa)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing taxa {missing[:5]}")
+            if extra:
+                details.append(f"unexpected taxa {extra[:5]}")
+            raise ValueError(
+                "Alignment taxa do not match across segments for concatenation in "
+                f"{file}: {'; '.join(details)}"
+            )
+        for key in concat_seqs:
+            concat_seqs[key] += seq_dict[key]
     
     # Convert to list and write seq records to fasta file
     concat_records = [concat_seqs[key] for key in concat_seqs]
@@ -117,7 +140,13 @@ def get_consensus_tree(tree_list,root=True):
         trees = tree_list
     else: 
         trees = dendropy.TreeList()
-        for tree_file in tree_list: trees.read(path=tree_file,schema='newick',rooting="default-rooted")
+        for tree_file in tree_list:
+            trees.read(
+                path=tree_file,
+                schema='newick',
+                rooting="default-rooted",
+                preserve_underscores=True,
+            )
     #consensus = trees.consensus(min_freq=0.95) # does not preserve branch lengths
     consensus = trees.maximum_product_of_split_support_tree()
     #print("\nTree {} maximizes the product of split support (log product = {}): {}".format(trees.index(mcct), mcct.log_product_of_split_support, mcct))

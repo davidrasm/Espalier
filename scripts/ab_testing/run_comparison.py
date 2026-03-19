@@ -145,7 +145,14 @@ def run_em_get_tree_path(argb: ARGBuilder,
     """
     # Run EM - this returns (ts, rec_rate, n_recomb, tree_path)
     # We want the tree_path for our comparison
-    result = argb.run_EM(ml_tree_files, seq_files, ref, scar_model, iters=em_iters)
+    result = argb.run_EM(
+        ml_tree_files,
+        seq_files,
+        ref,
+        scar_model,
+        iters=em_iters,
+        return_tree_path=True,
+    )
 
     # Unpack based on what run_EM returns
     if len(result) == 4:

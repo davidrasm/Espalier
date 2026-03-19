@@ -184,7 +184,12 @@ def convert_modern(tree_path, tree_intervals) -> Tuple[tskit.TreeSequence, Conve
     total_length = tree_intervals[-1][-1]
 
     # Convert tree to node and edge dataframes (reuse original functions)
-    from Espalier.Dendro2TSConverter import tree2nodesdf, tree2edgedf, reindex_edgedf
+    from Espalier.Dendro2TSConverter import (
+        _sort_nodes_df,
+        reindex_edgedf,
+        tree2edgedf,
+        tree2nodesdf,
+    )
 
     merged_node_df, tree = tree2nodesdf(tree)
     # Use Python int conversion to handle arbitrarily large bitmasks
@@ -202,8 +207,7 @@ def convert_modern(tree_path, tree_intervals) -> Tuple[tskit.TreeSequence, Conve
         next_node_df, tree = tree2nodesdf(tree, prev_node_df=merged_node_df)
         merged_node_df = pd.concat([merged_node_df, next_node_df], ignore_index=True)
         merged_node_df.drop_duplicates(ignore_index=True, inplace=True)
-        merged_node_df.sort_values('metadata', ignore_index=True, inplace=True)
-        merged_node_df.sort_values('time', ignore_index=True, inplace=True)
+        merged_node_df = _sort_nodes_df(merged_node_df)
 
         id_dict = dict(zip([int(x) for x in merged_node_df['unique_id']], merged_node_df.index))
         merged_edge_df = reindex_edgedf(merged_edge_df, id_dict)

@@ -16,6 +16,27 @@ import pandas as pd
 import copy
 import logging
 
+RECOMB_FLAG = getattr(tskit, "NODE_IS_RECOMBINATION", 131072)
+
+
+def _metadata_sort_key(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _sort_nodes_df(node_df):
+    sorted_df = node_df.copy()
+    sorted_df["_metadata_sort_key"] = sorted_df["metadata"].map(_metadata_sort_key)
+    sorted_df.sort_values(
+        ["time", "_metadata_sort_key"],
+        ignore_index=True,
+        inplace=True,
+        kind="mergesort",
+    )
+    sorted_df.drop(columns=["_metadata_sort_key"], inplace=True)
+    return sorted_df
+
 def convert(tree_path,tree_intervals):
     
     """
@@ -66,8 +87,7 @@ def convert(tree_path,tree_intervals):
         next_node_df, tree = tree2nodesdf(tree, prev_node_df=merged_node_df)
         merged_node_df = pd.concat([merged_node_df, next_node_df], ignore_index=True)
         merged_node_df.drop_duplicates(ignore_index=True,inplace=True)
-        merged_node_df.sort_values('metadata', ignore_index=True, inplace=True) # first sort on metadata (sample/taxon labels)
-        merged_node_df.sort_values('time', ignore_index=True, inplace=True) # then sort on times
+        merged_node_df = _sort_nodes_df(merged_node_df)
         
         # Create dictionary to map unique ids to new tskit node ids
         # Use Python int conversion to handle arbitrarily large bitmasks
@@ -188,14 +208,14 @@ def postorder_check(edges_df,nodes_df,tip_count):
             # Determine if parents are coalescent or recombination nodes
             parent_types = [nodes_df.at[x,'flags'] for x in nd_parents]
             #coal_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == 0] # not used
-            recomb_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == 131072]
+            recomb_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == RECOMB_FLAG]
             
             # Determine order of parents by their node times and get the most recent parent
             parent_times = [nodes_df.at[x,'time'] for x in nd_parents]
             mrp = nd_parents[np.argmin(parent_times)] # most recent parent
             mrp_type = nodes_df.at[mrp,'flags']
             
-            if mrp_type == 131072: # recomb event
+            if mrp_type == RECOMB_FLAG: # recomb event
 
                 if len(recomb_parents) > 2:
                     logging.error('Warning: node has more than two recombination node parents')
@@ -263,7 +283,7 @@ def postorder_check(edges_df,nodes_df,tip_count):
                     
                     # Add two addtional hidden rec nodes to nodes_df
                     time = nodes_df.at[nd_idx,'time'] + (nodes_df.at[recent_parent,'time'] - nodes_df.at[nd_idx,'time'])/2 # can just pick a random time between parent and child
-                    new_rec_node = {'flags': 131072, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
+                    new_rec_node = {'flags': RECOMB_FLAG, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
                     nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
                     left_recomb_parent = len(nodes_df.index) - 1
                     nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
@@ -325,7 +345,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
         # Get parent type (coalescent/recombination)
         parent_type = nodes_df.at[nd_idx,'flags']
         
-        if parent_type == 131072: # recomb event
+        if parent_type == RECOMB_FLAG: # recomb event
             
             # Not currently accounted for
             if len(nd_children) > 1:
@@ -394,7 +414,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
                 # add two rec nodes to nodes_df
                 # min_rec_time = max(nodes_df.at[changing_children[0],'time'],nodes_df.at[changing_children[1],'time'])
                 # time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_rec_time)/2 # can just pick a random time between parent and child
-                # new_rec_node = {'flags': 131072, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
+                # new_rec_node = {'flags': RECOMB_FLAG, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
                 # nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
                 # left_recomb_parent = len(nodes_df.index) - 1
                 # nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
@@ -447,15 +467,11 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
 
         if len(children) == 0: # node is a sampled tip
             flags = tskit.NODE_IS_SAMPLE
-            # Try to parse label as int, otherwise use string label directly
-            try:
-                metadata = int(node.taxon.label)
-            except (ValueError, TypeError):
-                metadata = node.taxon.label
+            metadata = str(node.taxon.label)
             node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':metadata, 'unique_id':unique_id})
             node.unique_id = unique_id
         elif len(children) == 1: # node is recombination event
-            flags = 131072 #recomb_flag
+            flags = RECOMB_FLAG # recomb_flag
             node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id})
             node.unique_id = recomb_id
             recomb_id -= 1 # decrement recombinant node unique id counter

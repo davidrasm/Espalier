@@ -14,7 +14,27 @@ from Espalier import TreeOps
 import numpy as np
 import math
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 import logging
+
+# Build an exact-id lookup and tolerate DendroPy's underscore/space conversions.
+def _build_seq_lookup(records, seq_file):
+    seq_dict = {}
+    for record in records:
+        key = record.id.strip()
+        normalized_record = SeqRecord(record.seq, id=key, name=key, description=key)
+        aliases = {
+            key,
+            key.replace("_", " "),
+        }
+        for alias in aliases:
+            existing = seq_dict.get(alias)
+            if existing is not None and existing.id != normalized_record.id:
+                raise ValueError(
+                    f"Duplicate sequence key '{alias}' while loading {seq_file}"
+                )
+            seq_dict[alias] = normalized_record
+    return seq_dict
 
 # For profiling only
 # import time
@@ -68,14 +88,7 @@ class Reconciler(object):
         # TODO: Could just pass seq_dict from init so we don't need to repeatedly import alignment
         my_records = list(SeqIO.parse(seq_file, "fasta"))
         
-        # Remove underscores from taxon names so compatible with dendropy taxon names
-        #seq_dict = {record.id:record for record in my_records}
-        seq_dict = {}
-        for record in my_records:
-            k = record.id.strip()
-            seq_dict[k] = record
-            # backward compatibility: allow underscore→space lookups
-            seq_dict[k.replace("_", " ")] = record
+        seq_dict = _build_seq_lookup(my_records, seq_file)
         total_length = len(seq_dict[next(iter(seq_dict))].seq)
         
         # Assume entire align in seq_file is genomic region if start/end positions not given

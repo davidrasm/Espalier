@@ -29,7 +29,6 @@ import os
 import sys
 import argparse
 import datetime
-import shutil
 import logging
 import numpy as np
 import dendropy
@@ -40,6 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from Espalier.ARGBuilder import ARGBuilder
+from Espalier.Reassortment import (
+    ANALYSIS_MODE_REASSORTMENT,
+    ANALYSIS_MODE_RECOMBINATION,
+    find_matching_tree,
+    prepare_analysis_inputs,
+)
 from Espalier.Reconciler import Reconciler
 from Espalier.RAxML import RAxMLRunner
 from Espalier.SCARLikelihood import SCAR
@@ -219,7 +224,8 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
         seq_files,
         ref,
         scar_model,
-        iters=em_iters
+        iters=em_iters,
+        return_tree_path=True,
     )
 
     logger.info(f"  Final estimated recombination rate: {rec_rate_est:.6f} per site")
@@ -438,6 +444,11 @@ Examples:
                         help='Skip EM estimation, only run basic ARG reconstruction')
     parser.add_argument('--use-modern-converter', action='store_true',
                         help='Use the modernized TreeSequence converter (3x faster, more robust)')
+    parser.add_argument('--analysis-mode', choices=[ANALYSIS_MODE_RECOMBINATION, ANALYSIS_MODE_REASSORTMENT],
+                        default=ANALYSIS_MODE_RECOMBINATION,
+                        help='Choose exact-label recombination analysis or isolate-normalized reassortment mode')
+    parser.add_argument('--isolate-field', type=int, default=0,
+                        help='Pipe-delimited FASTA field used as the isolate key in reassortment mode (default: 0)')
 
     return parser.parse_args()
 
@@ -466,10 +477,12 @@ def main():
     EM_ITERATIONS = args.em_iters
     NE = args.ne
     RAXML_PATH = args.raxml_path
+    ANALYSIS_MODE = args.analysis_mode
 
     logger.info("=" * 60)
     logger.info("Espalier ARG Analysis Pipeline")
     logger.info("=" * 60)
+    logger.info(f"Analysis mode: {ANALYSIS_MODE}")
 
     # Setup directories
     output_dir, temp_dir = setup_directories(BASE_DIR, args.output)
@@ -478,58 +491,20 @@ def main():
     logger.info(f"Tree directory: {TREE_DIR}")
 
     # Get sequence files - support both .fasta and .aln extensions
-    seq_files = sorted([
+    raw_seq_files = sorted([
         os.path.join(ALIGNMENT_DIR, f)
         for f in os.listdir(ALIGNMENT_DIR)
         if f.endswith('.fasta') or f.endswith('.aln')
     ])
 
-    logger.info(f"\nInput alignments ({len(seq_files)} segments):")
-    for sf in seq_files:
+    logger.info(f"\nInput alignments ({len(raw_seq_files)} segments):")
+    for sf in raw_seq_files:
         logger.info(f"  - {os.path.basename(sf)}")
 
-    # Calculate total genome length
-    from Bio import SeqIO
-    genome_length = sum(
-        len(list(SeqIO.parse(sf, "fasta"))[0])
-        for sf in seq_files
-    )
-    logger.info(f"\nTotal genome length: {genome_length} bp")
-
     # Check if pre-computed trees exist
-    # Try multiple naming conventions to match alignment files to tree files
-    def find_matching_tree(seq_file, tree_dir):
-        """Find a tree file matching the alignment file."""
-        base = os.path.basename(seq_file)
-        # Try various naming patterns
-        patterns = [
-            # Exact match with .tre extension
-            base + '.tre',
-            base + '.rooted.tre',
-            # Remove .fasta/.aln and add .tre
-            base.replace('.fasta', '.tre').replace('.aln', '.tre'),
-            base.replace('.fasta', '.rooted.tre').replace('.aln', '.rooted.tre'),
-            # Hantavirus convention
-            base.replace('_aligned_common.fasta', '_tree_common_binary.tre'),
-            base.replace('_aligned_common.fasta', '_tree_common.tre'),
-        ]
-
-        for pattern in patterns:
-            tree_file = os.path.join(tree_dir, pattern)
-            if os.path.exists(tree_file):
-                return tree_file
-
-        # Also try finding any tree that starts with the same prefix
-        prefix = base.split('.')[0]  # e.g., "HA-swine_H1_HANA" from "HA-swine_H1_HANA.fasta.aln"
-        for f in os.listdir(tree_dir):
-            if f.startswith(prefix) and f.endswith('.tre'):
-                return os.path.join(tree_dir, f)
-
-        return None
-
     use_precomputed = True
     precomputed_trees = []
-    for sf in seq_files:
+    for sf in raw_seq_files:
         tree_file = find_matching_tree(sf, TREE_DIR)
         if tree_file:
             precomputed_trees.append(tree_file)
@@ -538,22 +513,52 @@ def main():
             logger.warning(f"No matching tree found for: {os.path.basename(sf)}")
             break
 
-    if use_precomputed and len(precomputed_trees) == len(seq_files):
+    if use_precomputed and len(precomputed_trees) == len(raw_seq_files):
         logger.info(f"\nUsing pre-computed trees from {TREE_DIR}")
-        ml_tree_files = precomputed_trees
-        for tf in ml_tree_files:
+        raw_tree_files = precomputed_trees
+        for tf in raw_tree_files:
             logger.info(f"  - {os.path.basename(tf)}")
     else:
-        # Infer ML trees using RAxML-NG
+        raw_tree_files = None
+
+    prepared_inputs = prepare_analysis_inputs(
+        raw_seq_files,
+        raw_tree_files,
+        output_dir,
+        analysis_mode=ANALYSIS_MODE,
+        isolate_field=args.isolate_field,
+    )
+    seq_files = prepared_inputs.seq_files
+    if prepared_inputs.label_map_path:
+        logger.info(f"Derived label map: {prepared_inputs.label_map_path}")
+        logger.info(f"Normalized alignments: {prepared_inputs.normalized_alignments_dir}")
+        if prepared_inputs.tree_files:
+            logger.info(f"Normalized trees: {prepared_inputs.normalized_trees_dir}")
+
+    # Calculate total genome length after any reassortment normalization.
+    from Bio import SeqIO
+    genome_length = sum(
+        len(list(SeqIO.parse(sf, "fasta"))[0])
+        for sf in seq_files
+    )
+    logger.info(f"\nTotal genome length: {genome_length} bp")
+
+    if prepared_inputs.tree_files:
+        ml_tree_files = prepared_inputs.tree_files
+    else:
+        infer_tree_dir = (
+            prepared_inputs.normalized_trees_dir
+            if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT
+            else output_dir
+        )
         try:
-            ml_tree_files = infer_ml_trees(seq_files, output_dir, temp_dir, RAXML_PATH)
+            ml_tree_files = infer_ml_trees(seq_files, infer_tree_dir, temp_dir, RAXML_PATH)
         except Exception as e:
             logger.error(f"RAxML-NG failed: {e}")
             raise RuntimeError(f"Could not find or infer trees for all segments: {e}")
 
     # Build consensus reference tree
     ref = get_reference_tree(ml_tree_files, output_dir)
-    taxa = ref.taxon_namespace
 
     # Initialize Espalier components
     logger.info("\nInitializing Espalier components...")
@@ -592,8 +597,8 @@ def main():
             # Extract recombination information
             recomb_info = extract_recombination_info(ts, seq_files, output_dir)
 
-            # Map to segment boundaries (for reassortment)
-            segment_boundaries, segment_names = map_recombinations_to_segments(recomb_info, seq_files)
+            if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT:
+                map_recombinations_to_segments(recomb_info, seq_files)
 
         except Exception as e:
             logger.error(f"EM estimation failed: {e}")

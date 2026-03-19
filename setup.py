@@ -21,14 +21,20 @@ LONG_DESC_TYPE = "text/markdown"
 
 # To add for testing???: msprime, pyvolve
 INSTALL_REQUIRES = [
-      'numpy',
-      'dendropy',
-      'pandas',
-      'tskit',
-      'biopython',
-      'scipy',
-      'click'
+      'numpy>=2.4.3',
+      'DendroPy>=5.0.8',
+      'pandas>=3.0.1',
+      'tskit>=1.0.2',
+      'biopython>=1.86',
+      'scipy>=1.17.1',
+      'click>=8.3.1'
 ]
+
+EXTRAS_REQUIRE = {
+      'dev': [
+            'msprime>=1.4.1',
+      ],
+}
 
 setup(name=PACKAGE_NAME,
       version=VERSION,
@@ -40,6 +46,8 @@ setup(name=PACKAGE_NAME,
       author_email=AUTHOR_EMAIL,
       url=URL,
       install_requires=INSTALL_REQUIRES,
+      extras_require=EXTRAS_REQUIRE,
+      python_requires='>=3.11',
       #packages=['Espalier'],
       packages=find_packages(),
       entry_points={

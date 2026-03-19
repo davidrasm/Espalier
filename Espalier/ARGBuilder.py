@@ -158,6 +158,7 @@ class ARGBuilder(object):
                 true_trees: true local trees -- only used for debugging
                 report (boolean): prints report logging performance if True
                 min_rec_rate (float): threshold for minimum allowable recombination rate estimated in maximization step
+                return_tree_path (boolean): include the tree path with recombination nodes in the return value
                
             Returns:     
                tree_path (list): Tree path containing local trees in ARG
@@ -172,6 +173,7 @@ class ARGBuilder(object):
         # Or initialize in __init__?
         report = kwargs.get('report', None)
         true_trees = kwargs.get('true_trees', None)
+        return_tree_path = kwargs.get('return_tree_path', False)
         
         # Get initial rec_rate from coal_model
         rec_rate = coal_model.rec_rate # recombination rate per site
@@ -301,7 +303,9 @@ class ARGBuilder(object):
             ts = last_successful_ts
             inferred_recomb_events = last_successful_recomb_events
 
-        return ts, rec_rate, inferred_recomb_events, last_tree_path
+        if return_tree_path:
+            return ts, rec_rate, inferred_recomb_events, last_tree_path
+        return ts, rec_rate, inferred_recomb_events
     
     def _build_trellis(self,local_tree_files,seq_files,ref):
     
