@@ -29,6 +29,7 @@ import os
 import sys
 import argparse
 import datetime
+import json
 import logging
 import numpy as np
 import dendropy
@@ -47,14 +48,16 @@ from Espalier.Reassortment import (
 )
 from Espalier.Reconciler import Reconciler
 from Espalier.RAxML import RAxMLRunner
-from Espalier.SCARLikelihood import SCAR
+from Espalier.SCARLikelihood import BoundarySCAR, SCAR
 from Espalier import Utils
+from Espalier.ARGNodeTypes import RECOMBINANT_FLAG, summarize_recombination_events
 
 # Modern converter for improved TreeSequence conversion
 try:
-    from ab_testing.modern_converter import convert_modern, ConversionMetrics
+    from Espalier.ModernDendro2TSConverter import convert as modern_convert
     MODERN_CONVERTER_AVAILABLE = True
 except ImportError:
+    modern_convert = None
     MODERN_CONVERTER_AVAILABLE = False
 
 # Configure logging
@@ -63,6 +66,113 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_RECOMBINATION_REC_RATE = 1e-4
+DEFAULT_REASSORTMENT_REC_RATE_PER_YEAR = 0.1
+DEFAULT_REASSORTMENT_RATE_UPPER_PER_YEAR = 3.0
+DEFAULT_REASSORTMENT_REC_RATE_PER_DIVERGENCE = 0.1
+DEFAULT_REASSORTMENT_RATE_UPPER_PER_DIVERGENCE = 10.0
+
+TREE_TIME_UNIT_DIVERGENCE = "divergence"
+TREE_TIME_UNIT_TIME = "time"
+TREE_TIME_UNIT_GENERATIONS = "generations"
+
+
+def annual_rate_to_generation_rate(rate_per_year, generation_time_days):
+    return float(rate_per_year) * (float(generation_time_days) / 365.25)
+
+
+def generation_rate_to_annual_rate(rate_per_generation, generation_time_days):
+    return float(rate_per_generation) * (365.25 / float(generation_time_days))
+
+
+def get_reassortment_rate_units(tree_time_unit):
+    if tree_time_unit == TREE_TIME_UNIT_DIVERGENCE:
+        return (
+            "per_boundary_per_substitution_site",
+            "per boundary per substitution/site",
+        )
+    if tree_time_unit == TREE_TIME_UNIT_TIME:
+        return (
+            "per_boundary_per_year",
+            "per boundary per year",
+        )
+    if tree_time_unit == TREE_TIME_UNIT_GENERATIONS:
+        return (
+            "per_boundary_per_generation",
+            "per boundary per generation",
+        )
+    raise ValueError(f"Unsupported tree time unit '{tree_time_unit}'")
+
+
+def annualize_reassortment_rate(rate, tree_time_unit, generation_time_days, clock_rate):
+    if tree_time_unit == TREE_TIME_UNIT_TIME:
+        return float(rate)
+    if tree_time_unit == TREE_TIME_UNIT_GENERATIONS:
+        return generation_rate_to_annual_rate(rate, generation_time_days)
+    if tree_time_unit == TREE_TIME_UNIT_DIVERGENCE and clock_rate is not None:
+        return float(rate) * float(clock_rate)
+    return None
+
+
+def get_segment_lengths(seq_files):
+    from Bio import SeqIO
+
+    return [
+        len(list(SeqIO.parse(seq_file, "fasta"))[0])
+        for seq_file in seq_files
+    ]
+
+
+def get_boundary_positions(segment_lengths):
+    cumulative = 0
+    boundary_positions = []
+    for length in segment_lengths[:-1]:
+        cumulative += int(length)
+        boundary_positions.append(cumulative)
+    return boundary_positions
+
+
+def resolve_rate_configuration(args):
+    if args.analysis_mode == ANALYSIS_MODE_REASSORTMENT:
+        initial_rate = args.rec_rate
+        if initial_rate is None:
+            if args.tree_time_unit == TREE_TIME_UNIT_GENERATIONS:
+                initial_rate = annual_rate_to_generation_rate(
+                    DEFAULT_REASSORTMENT_REC_RATE_PER_YEAR,
+                    args.generation_time_days,
+                )
+            elif args.tree_time_unit == TREE_TIME_UNIT_TIME:
+                initial_rate = DEFAULT_REASSORTMENT_REC_RATE_PER_YEAR
+            else:
+                initial_rate = DEFAULT_REASSORTMENT_REC_RATE_PER_DIVERGENCE
+        lower = args.rec_rate_lower if args.rec_rate_lower is not None else 0.0
+        upper = args.rec_rate_upper
+        if upper is None:
+            if args.tree_time_unit == TREE_TIME_UNIT_GENERATIONS:
+                upper = annual_rate_to_generation_rate(
+                    DEFAULT_REASSORTMENT_RATE_UPPER_PER_YEAR,
+                    args.generation_time_days,
+                )
+            elif args.tree_time_unit == TREE_TIME_UNIT_TIME:
+                upper = DEFAULT_REASSORTMENT_RATE_UPPER_PER_YEAR
+            else:
+                upper = DEFAULT_REASSORTMENT_RATE_UPPER_PER_DIVERGENCE
+        return float(initial_rate), (float(lower), float(upper))
+
+    initial_rate = args.rec_rate if args.rec_rate is not None else DEFAULT_RECOMBINATION_REC_RATE
+    lower = args.rec_rate_lower if args.rec_rate_lower is not None else 0.0
+    upper = args.rec_rate_upper if args.rec_rate_upper is not None else 0.01
+    return float(initial_rate), (float(lower), float(upper))
+
+
+def write_inference_diagnostics(output_dir, diagnostics):
+    path = os.path.join(output_dir, "em_diagnostics.json")
+    with open(path, "w") as handle:
+        json.dump(diagnostics, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path
 
 
 def setup_directories(base_dir, output_base=None):
@@ -192,7 +302,17 @@ def reconstruct_arg_basic(argb, ml_tree_files, seq_files, ref, rec_rate, output_
     return tree_path, arg_tree_files
 
 
-def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_dir, em_iters=10, use_modern_converter=False):
+def run_em_estimation(
+    argb,
+    ml_tree_files,
+    seq_files,
+    ref,
+    scar_model,
+    output_dir,
+    em_iters=10,
+    use_modern_converter=False,
+    generation_time_days=3.0,
+):
     """
     Run EM algorithm for joint ARG reconstruction and recombination rate estimation.
 
@@ -208,8 +328,9 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
 
     Returns:
         ts: TreeSequence with full ARG
-        rec_rate_est: Estimated recombination rate
+        rec_rate_est: Estimated recombination/reassortment rate in model-native units
         n_recomb: Number of inferred recombination events
+        diagnostics: Estimation diagnostics and provenance
     """
     logger.info("=" * 60)
     logger.info("Step 3b: EM-based ARG reconstruction & rate estimation")
@@ -217,18 +338,41 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
     logger.info(f"  Initial recombination rate: {scar_model.rec_rate:.2e}")
     logger.info(f"  Running {em_iters} EM iterations...")
     if use_modern_converter:
-        logger.info("  Using MODERN converter (3x faster, more robust)")
+        if MODERN_CONVERTER_AVAILABLE:
+            logger.info("  Using modern TreeSequence converter")
+            ts_converter = modern_convert
+            ts_converter_name = "modern"
+        else:
+            logger.warning("  Modern converter unavailable; using legacy converter")
+            ts_converter = None
+            ts_converter_name = None
+    else:
+        logger.info("  Using legacy TreeSequence converter")
+        from Espalier import Dendro2TSConverter
+        ts_converter = Dendro2TSConverter.convert
+        ts_converter_name = "legacy"
 
-    ts, rec_rate_est, n_recomb, tree_path_with_recs = argb.run_EM(
+    ts, rec_rate_est, n_recomb, tree_path_with_recs, diagnostics = argb.run_EM(
         ml_tree_files,
         seq_files,
         ref,
         scar_model,
         iters=em_iters,
         return_tree_path=True,
+        return_diagnostics=True,
+        ts_converter=ts_converter,
+        ts_converter_name=ts_converter_name,
     )
 
-    logger.info(f"  Final estimated recombination rate: {rec_rate_est:.6f} per site")
+    logger.info(
+        f"  Final estimated rate: {rec_rate_est:.6f} {scar_model.rate_display_units}"
+    )
+    if scar_model.rate_units == "per_boundary_per_generation":
+        annual_rate = generation_rate_to_annual_rate(rec_rate_est, generation_time_days)
+        logger.info(
+            f"  Annualized reassortment rate: {annual_rate:.6f} per boundary per year "
+            f"(generation time {generation_time_days:.3f} days)"
+        )
     logger.info(f"  Inferred recombination events: {int(n_recomb)}")
 
     # Save trees with recombination nodes (even if TreeSequence conversion fails)
@@ -244,25 +388,6 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
             n_rec_nodes = sum(1 for node in tree.preorder_node_iter() if len(node.child_nodes()) == 1 and node.parent_node is not None)
             logger.info(f"       Recombination nodes in {seg_name}: {n_rec_nodes}")
 
-    # Try modern converter if requested and original failed or for better performance
-    if use_modern_converter and MODERN_CONVERTER_AVAILABLE and tree_path_with_recs is not None:
-        logger.info("  Converting tree path using modern converter...")
-        from Bio import SeqIO
-        tree_intervals = []
-        cumulative = 0
-        for sf in seq_files:
-            seq_length = len(list(SeqIO.parse(sf, "fasta"))[0])
-            tree_intervals.append((cumulative, cumulative + seq_length))
-            cumulative += seq_length
-
-        try:
-            ts, metrics = convert_modern(tree_path_with_recs, tree_intervals)
-            logger.info(f"  Modern converter: {metrics.n_nodes} nodes, {metrics.n_edges} edges, "
-                       f"{metrics.n_recomb_nodes} recomb nodes in {metrics.total_time:.3f}s")
-        except Exception as e:
-            logger.warning(f"  Modern converter failed: {e}")
-            logger.info("  Falling back to original TreeSequence if available")
-
     # Save TreeSequence if available
     if ts is not None:
         ts_file = os.path.join(output_dir, 'arg_treesequence.trees')
@@ -274,7 +399,15 @@ def run_em_estimation(argb, ml_tree_files, seq_files, ref, scar_model, output_di
         if tree_path_with_recs is None:
             raise ValueError("TreeSequence conversion failed and no tree path available")
 
-    return ts, rec_rate_est, n_recomb
+    return ts, rec_rate_est, n_recomb, diagnostics
+
+
+def apply_rate_unit_metadata(scar_model, tree_time_unit):
+    if getattr(scar_model, "rate_model_name", None) != "boundary_hotspot":
+        return
+    rate_units, rate_display_units = get_reassortment_rate_units(tree_time_unit)
+    scar_model.rate_units = rate_units
+    scar_model.rate_display_units = rate_display_units
 
 
 def extract_recombination_info(ts, seq_files, output_dir):
@@ -293,15 +426,20 @@ def extract_recombination_info(ts, seq_files, output_dir):
     logger.info("Step 4: Extracting recombination information")
     logger.info("=" * 60)
 
-    # Get recombination nodes (flag = 131072)
-    recomb_flag = 131072
     node_flags = ts.tables.nodes.flags
     node_times = ts.tables.nodes.time
 
-    recomb_node_ids = np.where(node_flags == recomb_flag)[0]
-    n_recomb_nodes = len(recomb_node_ids) // 2  # Each event creates 2 nodes
+    recomb_summary = summarize_recombination_events(ts)
+    recomb_node_ids = recomb_summary["recomb_node_ids"]
+    n_recomb_events = recomb_summary["n_events"]
+    unpaired_recomb_node_ids = recomb_summary["unpaired_recomb_node_ids"]
 
-    logger.info(f"  Recombination nodes found: {len(recomb_node_ids)} ({n_recomb_nodes} events)")
+    logger.info(
+        "  Recombination nodes found: %s; structural events: %s; unpaired nodes: %s",
+        recomb_summary["n_recomb_nodes"],
+        n_recomb_events,
+        len(unpaired_recomb_node_ids),
+    )
 
     # Get breakpoints (where tree topology changes)
     breakpoints = list(ts.breakpoints())
@@ -343,8 +481,17 @@ def extract_recombination_info(ts, seq_files, output_dir):
             f.write(f"  Segment {i+1}: {os.path.basename(sf)}\n")
         f.write("\n")
 
-        f.write(f"Total recombination events: {n_recomb_nodes}\n")
+        f.write(f"Total recombination events: {n_recomb_events}\n")
+        f.write(f"Recombinant flagged nodes: {recomb_summary['n_recomb_nodes']}\n")
+        f.write(f"Unpaired recombinant nodes: {unpaired_recomb_node_ids}\n")
         f.write(f"Breakpoints: {breakpoints}\n\n")
+
+        f.write("Structural Recombination Events:\n")
+        f.write("-" * 60 + "\n")
+        for event in recomb_summary["events"]:
+            parent_text = ", ".join(str(parent) for parent in event["parents"])
+            f.write(f"  Child {event['child']}: parents=[{parent_text}]\n")
+        f.write("\n")
 
         f.write("Recombination Node Details:\n")
         f.write("-" * 60 + "\n")
@@ -361,7 +508,11 @@ def extract_recombination_info(ts, seq_files, output_dir):
         logger.info(f"    [{interval.left:.0f}, {interval.right:.0f}): {tree.num_roots} root(s)")
 
     return {
-        'n_recomb_events': n_recomb_nodes,
+        'n_recomb_events': n_recomb_events,
+        'n_recomb_nodes': recomb_summary["n_recomb_nodes"],
+        'unpaired_recomb_nodes': unpaired_recomb_node_ids,
+        'unpaired_recomb_node_count': len(unpaired_recomb_node_ids),
+        'structural_recombination_events': recomb_summary["events"],
         'recomb_nodes': recomb_info,
         'breakpoints': breakpoints,
         'n_local_trees': ts.num_trees
@@ -432,8 +583,12 @@ Examples:
                         help='Directory containing pre-computed tree files (.tre)')
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Output directory (default: TestFiles/Outputs/arg_output_TIMESTAMP)')
-    parser.add_argument('--rec-rate', type=float, default=1e-4,
-                        help='Initial recombination rate per site (default: 1e-4)')
+    parser.add_argument('--rec-rate', type=float, default=None,
+                        help='Initial rate in model-native units. Recombination mode uses per site per generation; reassortment mode uses per boundary per generation.')
+    parser.add_argument('--rec-rate-lower', type=float, default=None,
+                        help='Lower optimization bound in model-native units (defaults depend on analysis mode).')
+    parser.add_argument('--rec-rate-upper', type=float, default=None,
+                        help='Upper optimization bound in model-native units (defaults depend on analysis mode).')
     parser.add_argument('--em-iters', type=int, default=5,
                         help='Number of EM iterations (default: 5)')
     parser.add_argument('--ne', type=float, default=1.0,
@@ -442,13 +597,29 @@ Examples:
                         help='Path to raxml-ng executable (default: raxml-ng)')
     parser.add_argument('--skip-em', action='store_true',
                         help='Skip EM estimation, only run basic ARG reconstruction')
-    parser.add_argument('--use-modern-converter', action='store_true',
-                        help='Use the modernized TreeSequence converter (3x faster, more robust)')
+    parser.add_argument('--use-modern-converter', action='store_true', default=True,
+                        help='Use the modernized TreeSequence converter (default)')
+    parser.add_argument('--use-legacy-converter', action='store_false', dest='use_modern_converter',
+                        help='Use the legacy TreeSequence converter')
     parser.add_argument('--analysis-mode', choices=[ANALYSIS_MODE_RECOMBINATION, ANALYSIS_MODE_REASSORTMENT],
                         default=ANALYSIS_MODE_RECOMBINATION,
                         help='Choose exact-label recombination analysis or isolate-normalized reassortment mode')
     parser.add_argument('--isolate-field', type=int, default=0,
                         help='Pipe-delimited FASTA field used as the isolate key in reassortment mode (default: 0)')
+    parser.add_argument('--tree-time-unit',
+                        choices=[
+                            TREE_TIME_UNIT_DIVERGENCE,
+                            TREE_TIME_UNIT_TIME,
+                            TREE_TIME_UNIT_GENERATIONS,
+                        ],
+                        default=TREE_TIME_UNIT_DIVERGENCE,
+                        help='Units of input tree branch lengths for reassortment rate reporting. '
+                             'Use divergence for substitutions/site, time for calendar years, '
+                             'or generations for coalescent-generation trees.')
+    parser.add_argument('--clock-rate', type=float, default=None,
+                        help='Clock rate in substitutions/site/year. Only used to annualize divergence-unit trees.')
+    parser.add_argument('--generation-time-days', type=float, default=3.0,
+                        help='Generation time used when annualizing generation-unit reassortment rates (default: 3.0)')
 
     return parser.parse_args()
 
@@ -473,7 +644,7 @@ def main():
         TREE_DIR = os.path.join(BASE_DIR, 'TestFiles', 'trees')
 
     # Analysis parameters
-    INITIAL_REC_RATE = args.rec_rate
+    INITIAL_REC_RATE, RATE_BOUNDS = resolve_rate_configuration(args)
     EM_ITERATIONS = args.em_iters
     NE = args.ne
     RAXML_PATH = args.raxml_path
@@ -483,6 +654,12 @@ def main():
     logger.info("Espalier ARG Analysis Pipeline")
     logger.info("=" * 60)
     logger.info(f"Analysis mode: {ANALYSIS_MODE}")
+    logger.info(f"Initial rate: {INITIAL_REC_RATE:.6g}")
+    logger.info(f"Rate bounds: ({RATE_BOUNDS[0]:.6g}, {RATE_BOUNDS[1]:.6g})")
+    if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT:
+        logger.info(f"Tree time unit: {args.tree_time_unit}")
+        if args.tree_time_unit == TREE_TIME_UNIT_DIVERGENCE and args.clock_rate is not None:
+            logger.info(f"Clock rate for annualization: {args.clock_rate:.6g} substitutions/site/year")
 
     # Setup directories
     output_dir, temp_dir = setup_directories(BASE_DIR, args.output)
@@ -536,12 +713,12 @@ def main():
             logger.info(f"Normalized trees: {prepared_inputs.normalized_trees_dir}")
 
     # Calculate total genome length after any reassortment normalization.
-    from Bio import SeqIO
-    genome_length = sum(
-        len(list(SeqIO.parse(sf, "fasta"))[0])
-        for sf in seq_files
-    )
+    segment_lengths = get_segment_lengths(seq_files)
+    genome_length = sum(segment_lengths)
+    boundary_positions = get_boundary_positions(segment_lengths)
     logger.info(f"\nTotal genome length: {genome_length} bp")
+    if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT:
+        logger.info(f"Segment boundary positions: {boundary_positions}")
 
     if prepared_inputs.tree_files:
         ml_tree_files = prepared_inputs.tree_files
@@ -578,20 +755,40 @@ def main():
 
     if args.skip_em:
         logger.info("\nSkipping EM estimation (--skip-em flag set)")
+        em_diagnostics = {
+            "estimate_source": "skip_em",
+            "estimate_status": "skipped",
+            "rate_model_name": "unestimated",
+            "rate_units": "unestimated",
+            "rate_display_units": "unestimated",
+            "opt_bounds": list(RATE_BOUNDS),
+        }
     else:
         logger.info("\nInitializing SCAR coalescent model...")
-        scar_model = SCAR(
-            rec_rate=INITIAL_REC_RATE,
-            M=[[0]],  # Single population (no migration)
-            Ne=NE,
-            genome_length=genome_length,
-            bounds=(0, 0.01)  # Reasonable bounds for rec rate
-        )
+        if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT:
+            scar_model = BoundarySCAR(
+                rec_rate=INITIAL_REC_RATE,
+                M=[[0]],  # Single population (no migration)
+                Ne=NE,
+                genome_length=genome_length,
+                boundary_positions=boundary_positions,
+                bounds=RATE_BOUNDS,
+            )
+            apply_rate_unit_metadata(scar_model, args.tree_time_unit)
+        else:
+            scar_model = SCAR(
+                rec_rate=INITIAL_REC_RATE,
+                M=[[0]],  # Single population (no migration)
+                Ne=NE,
+                genome_length=genome_length,
+                bounds=RATE_BOUNDS,
+            )
 
         try:
-            ts, rec_rate_est, n_recomb = run_em_estimation(
+            ts, rec_rate_est, n_recomb, em_diagnostics = run_em_estimation(
                 argb, ml_tree_files, seq_files, ref, scar_model, output_dir, EM_ITERATIONS,
-                use_modern_converter=args.use_modern_converter
+                use_modern_converter=args.use_modern_converter,
+                generation_time_days=args.generation_time_days,
             )
 
             # Extract recombination information
@@ -605,6 +802,14 @@ def main():
             logger.info("Continuing with basic ARG reconstruction results...")
             import traceback
             logger.debug(traceback.format_exc())
+            em_diagnostics = {
+                "estimate_source": "em_failure",
+                "estimate_status": "failed",
+                "rate_model_name": getattr(scar_model, "rate_model_name", "unknown"),
+                "rate_units": getattr(scar_model, "rate_units", "unknown"),
+                "rate_display_units": getattr(scar_model, "rate_display_units", "unknown"),
+                "opt_bounds": list(RATE_BOUNDS),
+            }
 
     # Final summary
     logger.info("\n" + "=" * 60)
@@ -612,10 +817,60 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Number of segments: {len(seq_files)}")
-    logger.info(f"Estimated recombination rate: {rec_rate_est:.6f} per site")
+    if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT:
+        rate_units, rate_display_units = get_reassortment_rate_units(args.tree_time_unit)
+        annual_rate = annualize_reassortment_rate(
+            rec_rate_est,
+            args.tree_time_unit,
+            args.generation_time_days,
+            args.clock_rate,
+        )
+        logger.info(f"Estimated reassortment rate: {rec_rate_est:.6f} {rate_display_units}")
+        if annual_rate is not None:
+            logger.info(f"Estimated reassortment rate (annualized): {annual_rate:.6f} per boundary per year")
+        else:
+            logger.info("Estimated reassortment rate was not annualized; provide --clock-rate for divergence trees")
+    else:
+        logger.info(f"Estimated recombination rate: {rec_rate_est:.6f} per site")
     if ts:
         logger.info(f"Recombination events detected: {int(n_recomb)}")
         logger.info(f"TreeSequence file: {os.path.join(output_dir, 'arg_treesequence.trees')}")
+
+    annual_rate = (
+        annualize_reassortment_rate(
+            rec_rate_est,
+            args.tree_time_unit,
+            args.generation_time_days,
+            args.clock_rate,
+        )
+        if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT
+        else None
+    )
+    rate_units, rate_display_units = (
+        get_reassortment_rate_units(args.tree_time_unit)
+        if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT
+        else ("per_site_per_generation", "per site per generation")
+    )
+    em_diagnostics.update(
+        {
+            "analysis_mode": ANALYSIS_MODE,
+            "generation_time_days": args.generation_time_days,
+            "tree_time_unit": args.tree_time_unit if ANALYSIS_MODE == ANALYSIS_MODE_REASSORTMENT else None,
+            "clock_rate_subs_per_site_per_year": args.clock_rate,
+            "initial_rate": INITIAL_REC_RATE,
+            "rate_bounds": list(RATE_BOUNDS),
+            "estimated_rate": rec_rate_est,
+            "estimated_rate_units": rate_units,
+            "estimated_rate_display_units": rate_display_units,
+            "estimated_rate_per_year": annual_rate,
+            "segment_lengths": segment_lengths,
+            "boundary_positions": boundary_positions,
+            "n_recomb_events": int(n_recomb),
+            "has_treesequence": bool(ts),
+        }
+    )
+    diagnostics_path = write_inference_diagnostics(output_dir, em_diagnostics)
+    logger.info(f"Inference diagnostics: {diagnostics_path}")
 
     # Cleanup temp directory (optional)
     # shutil.rmtree(temp_dir)

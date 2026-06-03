@@ -16,7 +16,9 @@ import pandas as pd
 import copy
 import logging
 
-RECOMB_FLAG = getattr(tskit, "NODE_IS_RECOMBINATION", 131072)
+from Espalier.ARGNodeTypes import RECOMBINANT_FLAG, SAMPLE_FLAG, is_recombinant
+
+RECOMB_FLAG = RECOMBINANT_FLAG
 
 
 def _metadata_sort_key(value):
@@ -37,23 +39,24 @@ def _sort_nodes_df(node_df):
     sorted_df.drop(columns=["_metadata_sort_key"], inplace=True)
     return sorted_df
 
-def convert(tree_path,tree_intervals):
+def convert(tree_path,tree_intervals,run_deep_checks=False):
     
     """
         Main conversion routine for converting tree_path with recombination events into tskit TreeSequence.
         Local trees are first converted into node and edge tables, which are sequentially merged across genome regions (segments)
         After merging, duplicate nodes/edges are removed from these tables.
-        Two checks are performed on tables to ensure a valid ARG can be constructed:
+        Two optional checks can be performed on tables to repair difficult ARGs:
         1) A "post-order" check to ensure all nodes have one and only one parent
         2) A "pre-order" check to ensure no node has more than two children
-        Additional "hidden" nodes may be added during checks to satisfy parent-child requirements
-        While these two checks are necessary to ensure a valid ARG, they are not sufficient and conversion may still fail.
+        Additional "hidden" nodes may be added during checks to satisfy parent-child requirements.
+        While these two checks can help, they are not sufficient and conversion may still fail.
         
         Important: all unifurcations in local trees will be interpreted as recombination events
         
         Parameters:     
             tree_path (list(dendropy.Tree)): tree path
-            tree_intervals (list(tuple)): list of genomic intervals for each local tree specified as a tuple (start,end) 
+            tree_intervals (list(tuple)): list of genomic intervals for each local tree specified as a tuple (start,end)
+            run_deep_checks (bool): run slower post/pre-order repairs after initial tskit validation
                  
         Returns:     
            merged_ts (tskit.TreeSequence): tree sequence representing a connected ARG
@@ -136,13 +139,10 @@ def convert(tree_path,tree_intervals):
             else:
                 raise
 
-    # Return early if we already have a valid TreeSequence
-    # The post/pre-order checks can be slow and may cause issues with complex ARGs
-    # For now, skip them and return the initial TreeSequence
-    logging.info("Skipping post/pre-order checks - returning initial TreeSequence")
-    return merged_ts
+    if not run_deep_checks:
+        logging.info("Skipping optional post/pre-order checks - returning validated TreeSequence")
+        return merged_ts
 
-    # NOTE: Code below is kept but not executed - can be re-enabled if needed
     # Work with TableCollection for checking instead of TreeSequence b/c TS are not mutable
     tables = merged_ts.dump_tables() # return copy of tables we'll work with
     edges_df, nodes_df = treeTables2df(tables)
@@ -208,14 +208,14 @@ def postorder_check(edges_df,nodes_df,tip_count):
             # Determine if parents are coalescent or recombination nodes
             parent_types = [nodes_df.at[x,'flags'] for x in nd_parents]
             #coal_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == 0] # not used
-            recomb_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == RECOMB_FLAG]
+            recomb_parents = [y for x,y in enumerate(nd_parents) if is_recombinant(parent_types[x])]
             
             # Determine order of parents by their node times and get the most recent parent
             parent_times = [nodes_df.at[x,'time'] for x in nd_parents]
             mrp = nd_parents[np.argmin(parent_times)] # most recent parent
             mrp_type = nodes_df.at[mrp,'flags']
             
-            if mrp_type == RECOMB_FLAG: # recomb event
+            if is_recombinant(mrp_type): # recomb event
 
                 if len(recomb_parents) > 2:
                     logging.error('Warning: node has more than two recombination node parents')
@@ -345,7 +345,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
         # Get parent type (coalescent/recombination)
         parent_type = nodes_df.at[nd_idx,'flags']
         
-        if parent_type == RECOMB_FLAG: # recomb event
+        if is_recombinant(parent_type): # recomb event
             
             # Not currently accounted for
             if len(nd_children) > 1:
@@ -466,7 +466,7 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
         unique_id = node.edge.split_bitmask
 
         if len(children) == 0: # node is a sampled tip
-            flags = tskit.NODE_IS_SAMPLE
+            flags = SAMPLE_FLAG
             metadata = str(node.taxon.label)
             node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':metadata, 'unique_id':unique_id})
             node.unique_id = unique_id
@@ -525,11 +525,20 @@ def reindex_edgedf(edge_df,id_dict):
         id_dict maps unique_ids -> updated node ids
     """
 
-    for index, row in edge_df.iterrows():
-        row.parent = id_dict[row.parent_unique_id]
-        row.child = id_dict[row.child_unique_id]
-        
-    return edge_df
+    reindexed = edge_df.copy()
+    try:
+        reindexed['parent'] = [
+            id_dict[int(unique_id)]
+            for unique_id in reindexed['parent_unique_id']
+        ]
+        reindexed['child'] = [
+            id_dict[int(unique_id)]
+            for unique_id in reindexed['child_unique_id']
+        ]
+    except KeyError as e:
+        raise KeyError(f"Could not reindex edge endpoint with unique_id {e}") from e
+
+    return reindexed.astype({"parent": int, "child": int})
 
 
 def df2TreeTables(edge_df,node_df,total_length):
@@ -566,7 +575,7 @@ def treeTables2df(tables):
                   'population':tables.nodes.population,
                   'individual':tables.nodes.individual,
                   'time':tables.nodes.time,
-                  'metadata':tables.nodes.time}
+                  'metadata':[None] * len(tables.nodes)}
     nodes_df = pd.DataFrame.from_dict(nodes_dict)
     
     return edges_df, nodes_df

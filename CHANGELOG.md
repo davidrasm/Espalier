@@ -68,7 +68,7 @@ This fork addresses several compatibility issues with modern Python packages and
 
 - Modified `run_EM()` to return the tree path with recombination nodes
 - Previously only returned TreeSequence, which loses tree structure if conversion fails
-- New return signature: `(ts, rec_rate, n_recomb, tree_path)`
+- Return signatures can include the tree path and EM diagnostics when requested
 
 ---
 
@@ -89,7 +89,7 @@ Complete pipeline script demonstrating Espalier usage:
 **Directory:** `scripts/ab_testing/`
 
 Framework for comparing original vs. modernized implementations:
-- `modern_converter.py`: Reimplemented converter using tskit 0.6.0+ features
+- `Espalier/ModernDendro2TSConverter.py`: Reimplemented converter using modern tskit table APIs
   - Vectorized time constraint fixing (3.3x faster)
   - `extend_haplotypes()` for edge compression
   - Proper tree path preparation for Viterbi outputs
@@ -127,12 +127,13 @@ Tested with:
 - Python 3.10+
 - NumPy 2.0+
 - pandas 2.0+
-- tskit 0.5.0+
-- dendropy 4.5+
+- tskit 1.0.3+
+- msprime 1.4.2+ for simulation workflows
+- dendropy 5.0.8+
 - RAxML-NG
 
 ---
 
 ## Notes for Future Development
 
-The A/B testing revealed that the modern converter's `prepare_tree_path()` function (which reconciles linked heights and adds recombination nodes) is essential for Viterbi outputs. The original converter expects trees that have already been processed through the EM pipeline's preprocessing steps. This could be integrated into the main codebase to make `Dendro2TSConverter.convert()` more robust for direct Viterbi path conversion.
+The modern converter is now the default EM TreeSequence conversion path. The legacy converter remains available for comparison and troubleshooting.

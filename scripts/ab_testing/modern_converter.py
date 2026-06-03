@@ -15,7 +15,6 @@ Author: Ricardo Rivero
 """
 
 import tskit
-import msprime
 import numpy as np
 import pandas as pd
 import logging
@@ -25,9 +24,9 @@ from typing import List, Tuple, Dict, Optional
 
 import Espalier.Reconciler as ReconcilerModule
 from Espalier.ARGBuilder import _jitter_coal_times, add_path_rec_nodes
+from Espalier.ARGNodeTypes import RECOMBINANT_FLAG, count_recombinant_nodes
 
-# Use tskit constants instead of magic numbers
-RECOMB_FLAG = msprime.NODE_IS_RE_EVENT  # 131072
+RECOMB_FLAG = RECOMBINANT_FLAG
 
 
 @dataclass
@@ -259,8 +258,7 @@ def convert_modern(tree_path, tree_intervals) -> Tuple[tskit.TreeSequence, Conve
     metrics.n_edges = merged_ts.num_edges
 
     # Count recombination nodes using tskit constant
-    recomb_nodes = np.sum(merged_ts.tables.nodes.flags == RECOMB_FLAG)
-    metrics.n_recomb_nodes = recomb_nodes
+    metrics.n_recomb_nodes = count_recombinant_nodes(merged_ts.tables.nodes.flags)
 
     logging.info(f"[Modern] Conversion complete: {metrics.n_nodes} nodes, {metrics.n_edges} edges, "
                  f"{metrics.n_recomb_nodes} recomb nodes ({metrics.total_time:.3f}s)")
@@ -292,8 +290,7 @@ def convert_original(tree_path, tree_intervals) -> Tuple[tskit.TreeSequence, Con
     metrics.n_edges = merged_ts.num_edges
 
     # Count recombination nodes
-    recomb_nodes = np.sum(merged_ts.tables.nodes.flags == RECOMB_FLAG)
-    metrics.n_recomb_nodes = recomb_nodes
+    metrics.n_recomb_nodes = count_recombinant_nodes(merged_ts.tables.nodes.flags)
 
     logging.info(f"[Original] Conversion complete: {metrics.n_nodes} nodes, {metrics.n_edges} edges, "
                  f"{metrics.n_recomb_nodes} recomb nodes ({metrics.total_time:.3f}s)")
@@ -335,8 +332,8 @@ def compare_tree_sequences(ts_a: tskit.TreeSequence,
         results['differences'].append(f"Tree count: {label_a}={ts_a.num_trees}, {label_b}={ts_b.num_trees}")
 
     # Compare recombination nodes
-    recomb_a = np.sum(ts_a.tables.nodes.flags == RECOMB_FLAG)
-    recomb_b = np.sum(ts_b.tables.nodes.flags == RECOMB_FLAG)
+    recomb_a = count_recombinant_nodes(ts_a.tables.nodes.flags)
+    recomb_b = count_recombinant_nodes(ts_b.tables.nodes.flags)
     if recomb_a != recomb_b:
         results['differences'].append(f"Recomb nodes: {label_a}={recomb_a}, {label_b}={recomb_b}")
 

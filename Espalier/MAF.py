@@ -474,7 +474,7 @@ def get_spr_dist(ref,alt):
     
     if ref.taxon_namespace is not alt.taxon_namespace:
         alt.taxon_namespace = ref.taxon_namespace
-        alt.reindex_subcomponent_taxa()
+        alt.reconstruct_taxon_namespace()
     maf = get_maf_4cut(ref,alt)
     spr_dist = len(maf) - 1
     

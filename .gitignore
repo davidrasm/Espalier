@@ -7,13 +7,15 @@ Espalier.egg-info
 Espalier/__pycache__/
 *.pyc
 
-# Test output files (but keep alignments and trees)
-TestFiles/Outputs/
+# Data, generated outputs, and benchmark artifacts
+TestFiles/
+FluTest*/
+SimulationBenchmarks/
+EmpiricalReassortmentBenchmarks/
+benchmark_results.csv
+benchmark_summary.json
+benchmark_config.json
 arg_output_*/
 *.trees
-/TestFiles/trees
-/TestFiles/alignments
 /scripts/ab_testing/Outputs
 scripts/ab_testing/generate_results_pdf.py
-/TestFiles/FluTest
-/TestFiles/FluTest_subsampled

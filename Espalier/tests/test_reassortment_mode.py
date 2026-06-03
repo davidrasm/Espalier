@@ -4,12 +4,22 @@ from types import SimpleNamespace
 
 import dendropy
 import numpy as np
+import pandas as pd
 import pytest
+import tskit
 from Bio import SeqIO
 
 import Espalier.ARGBuilder as ARGBuilderModule
+import scripts.run_arg_analysis as RunArgAnalysis
+from Espalier import Dendro2TSConverter
 from Espalier import Utils
 from Espalier.ARGBuilder import ARGBuilder
+from Espalier.ARGNodeTypes import (
+    RECOMBINANT_FLAG,
+    count_recombination_events,
+    is_recombinant,
+    summarize_recombination_events,
+)
 from Espalier.Dendro2TSConverter import convert
 from Espalier.Reassortment import (
     ANALYSIS_MODE_REASSORTMENT,
@@ -17,6 +27,7 @@ from Espalier.Reassortment import (
     prepare_analysis_inputs,
     select_isolates_by_week,
 )
+from Espalier.SCARLikelihood import BoundarySCAR
 
 
 def _write_fasta(path: Path, records):
@@ -201,7 +212,7 @@ def test_concate_aligns_reports_missing_taxa(tmp_path):
         Utils.concate_aligns([str(seg1), str(seg2)], str(concat))
 
 
-def test_convert_handles_mixed_numeric_and_string_tip_labels():
+def test_convert_handles_mixed_numeric_and_string_tip_labels(tmp_path):
     taxa = dendropy.TaxonNamespace()
     tree_data = "((1:1,A:1):1,2:2);"
     tree1 = dendropy.Tree.get(
@@ -223,6 +234,170 @@ def test_convert_handles_mixed_numeric_and_string_tip_labels():
 
     assert ts.num_nodes > 0
     assert ts.sequence_length == 20
+    ts_path = tmp_path / "mixed_labels.trees"
+    ts.dump(str(ts_path))
+    loaded = tskit.load(str(ts_path))
+    assert loaded.sequence_length == ts.sequence_length
+
+
+def test_reindex_edgedf_updates_parent_child_columns():
+    edge_df = pd.DataFrame(
+        [
+            {
+                "left": 0,
+                "right": 10,
+                "parent": 0,
+                "child": 1,
+                "parent_unique_id": 100,
+                "child_unique_id": 200,
+            }
+        ]
+    )
+
+    reindexed = Dendro2TSConverter.reindex_edgedf(edge_df, {100: 3, 200: 4})
+
+    assert reindexed.loc[0, "parent"] == 3
+    assert reindexed.loc[0, "child"] == 4
+    assert edge_df.loc[0, "parent"] == 0
+    assert edge_df.loc[0, "child"] == 1
+
+
+def test_tree_tables_to_df_does_not_alias_metadata_to_time():
+    tables = tskit.TableCollection(10)
+    sample_a = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=-1)
+    sample_b = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=-1)
+    parent = tables.nodes.add_row(flags=0, time=1, population=-1)
+    tables.edges.add_row(0, 10, parent, sample_a)
+    tables.edges.add_row(0, 10, parent, sample_b)
+    tables.sort()
+
+    _, nodes_df = Dendro2TSConverter.treeTables2df(tables)
+
+    assert nodes_df["metadata"].tolist() == [None, None, None]
+
+
+def test_recombinant_flag_checks_are_bitwise():
+    assert is_recombinant(RECOMBINANT_FLAG)
+    assert is_recombinant(RECOMBINANT_FLAG | tskit.NODE_IS_SAMPLE)
+
+
+def test_boundary_scar_counts_adjacent_segment_boundary_opportunity():
+    model = BoundarySCAR(
+        rec_rate=0.1,
+        M=[[0]],
+        Ne=1.0,
+        genome_length=20,
+        boundary_positions=[10],
+    )
+    children = np.array([5, 5, 6])
+    lefts = np.array([0, 10, 0])
+    rights = np.array([10, 20, 5])
+
+    assert model._get_line_recomb_opportunities(5, children, rights, lefts) == 1
+    assert model._get_line_recomb_opportunities(6, children, rights, lefts) == 0
+
+
+def test_boundary_scar_likelihood_is_finite_for_adjacent_segment_reassortment():
+    tables = tskit.TableCollection(20)
+    sample = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=-1)
+    left_recomb = tables.nodes.add_row(flags=RECOMBINANT_FLAG, time=1, population=-1)
+    right_recomb = tables.nodes.add_row(flags=RECOMBINANT_FLAG, time=1, population=-1)
+    root = tables.nodes.add_row(flags=0, time=2, population=-1)
+    tables.edges.add_row(0, 10, left_recomb, sample)
+    tables.edges.add_row(10, 20, right_recomb, sample)
+    tables.edges.add_row(0, 10, root, left_recomb)
+    tables.edges.add_row(10, 20, root, right_recomb)
+    tables.sort()
+    ts = tables.tree_sequence()
+
+    model = BoundarySCAR(
+        rec_rate=0.1,
+        M=[[0]],
+        Ne=1.0,
+        genome_length=20,
+        boundary_positions=[10],
+        bounds=(0, 1),
+    )
+    neg_log_like = model.compute_neg_log_like(0.1, ts)
+
+    assert np.isfinite(neg_log_like)
+    assert model.last_likelihood_diagnostics["status"] == "finite"
+    assert model.last_likelihood_diagnostics["observed_recombination_events"] == 1
+    assert model.last_likelihood_diagnostics["zero_recomb_opportunity_events"] == 0
+    assert model.last_likelihood_diagnostics["recomb_exposure"] > 0
+
+
+def test_structural_recombination_count_ignores_unpaired_recombinant_nodes(tmp_path):
+    tables = tskit.TableCollection(20)
+    sample = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=-1)
+    singleton_sample = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0, population=-1)
+    left_recomb = tables.nodes.add_row(flags=RECOMBINANT_FLAG, time=1, population=-1)
+    right_recomb = tables.nodes.add_row(flags=RECOMBINANT_FLAG, time=1, population=-1)
+    unpaired_recomb = tables.nodes.add_row(flags=RECOMBINANT_FLAG, time=1, population=-1)
+    root = tables.nodes.add_row(flags=0, time=2, population=-1)
+    singleton_left_root = tables.nodes.add_row(flags=0, time=2, population=-1)
+    singleton_right_root = tables.nodes.add_row(flags=0, time=2, population=-1)
+
+    tables.edges.add_row(0, 10, left_recomb, sample)
+    tables.edges.add_row(10, 20, right_recomb, sample)
+    tables.edges.add_row(0, 10, root, left_recomb)
+    tables.edges.add_row(10, 20, root, right_recomb)
+    tables.edges.add_row(0, 10, unpaired_recomb, singleton_sample)
+    tables.edges.add_row(0, 10, singleton_left_root, unpaired_recomb)
+    tables.edges.add_row(10, 20, singleton_right_root, singleton_sample)
+    tables.sort()
+    ts = tables.tree_sequence()
+
+    summary = summarize_recombination_events(ts)
+
+    assert count_recombination_events(ts) == 1
+    assert summary["n_recomb_nodes"] == 3
+    assert summary["n_events"] == 1
+    assert summary["unpaired_recomb_node_ids"] == [unpaired_recomb]
+
+    seq_file = tmp_path / "segment.fasta"
+    seq_file.write_text(">sample\nAAAA\n")
+    recomb_info = RunArgAnalysis.extract_recombination_info(
+        ts,
+        [str(seq_file)],
+        str(tmp_path),
+    )
+
+    assert recomb_info["n_recomb_events"] == 1
+    assert recomb_info["n_recomb_nodes"] == 3
+    assert recomb_info["unpaired_recomb_nodes"] == [unpaired_recomb]
+    assert "Total recombination events: 1" in (tmp_path / "recombination_summary.txt").read_text()
+
+
+def test_reassortment_rate_unit_helpers_distinguish_tree_time_units():
+    assert RunArgAnalysis.get_reassortment_rate_units("divergence") == (
+        "per_boundary_per_substitution_site",
+        "per boundary per substitution/site",
+    )
+    assert RunArgAnalysis.annualize_reassortment_rate(
+        2.0,
+        "divergence",
+        generation_time_days=3.0,
+        clock_rate=0.005,
+    ) == pytest.approx(0.01)
+    assert RunArgAnalysis.annualize_reassortment_rate(
+        2.0,
+        "divergence",
+        generation_time_days=3.0,
+        clock_rate=None,
+    ) is None
+    assert RunArgAnalysis.annualize_reassortment_rate(
+        2.0,
+        "time",
+        generation_time_days=3.0,
+        clock_rate=None,
+    ) == pytest.approx(2.0)
+    assert RunArgAnalysis.annualize_reassortment_rate(
+        2.0,
+        "generations",
+        generation_time_days=3.0,
+        clock_rate=None,
+    ) == pytest.approx(243.5)
 
 
 def test_select_isolates_by_week_is_shared_and_order_independent(tmp_path):
@@ -262,8 +437,14 @@ class _FakeCoalModel:
     def __init__(self, rec_rate=0.1, genome_length=5):
         self.rec_rate = rec_rate
         self.genome_length = genome_length
+        self.rate_model_name = "uniform_site"
+        self.rate_units = "per_site_per_generation"
+        self.rate_display_units = "per site per generation"
+        self.bounds = (0.0, 1.0)
+        self.last_opt_result = None
 
     def opt_MLE(self, ts):
+        self.last_rate_estimate_status = "interior"
         return 0.25
 
 
@@ -318,9 +499,16 @@ def test_run_em_return_contract(monkeypatch):
     )
     monkeypatch.setattr(ARGBuilderModule, "_jitter_coal_times", lambda tree_path, displace_dt=0.0001: tree_path)
     monkeypatch.setattr(ARGBuilderModule, "add_path_rec_nodes", lambda tree_path: (tree_path, 0))
-    monkeypatch.setattr(ARGBuilderModule.Dendro2TSConverter, "convert", lambda tree_path, tree_intervals: fake_ts)
+    fake_converter = lambda tree_path, tree_intervals: fake_ts
 
-    default_result = builder.run_EM(["tree"], ["seq"], ref, _FakeCoalModel(), iters=1)
+    default_result = builder.run_EM(
+        ["tree"],
+        ["seq"],
+        ref,
+        _FakeCoalModel(),
+        iters=1,
+        ts_converter=fake_converter,
+    )
     tree_path_result = builder.run_EM(
         ["tree"],
         ["seq"],
@@ -328,9 +516,28 @@ def test_run_em_return_contract(monkeypatch):
         _FakeCoalModel(),
         iters=1,
         return_tree_path=True,
+        ts_converter=fake_converter,
     )
 
     assert len(default_result) == 3
     assert len(tree_path_result) == 4
     assert tree_path_result[3] is not None
     assert len(tree_path_result[3]) == 1
+
+    diagnostics_result = builder.run_EM(
+        ["tree"],
+        ["seq"],
+        ref,
+        _FakeCoalModel(),
+        iters=1,
+        return_diagnostics=True,
+        ts_converter=fake_converter,
+        ts_converter_name="fake",
+    )
+
+    assert len(diagnostics_result) == 4
+    diagnostics = diagnostics_result[3]
+    assert diagnostics["estimate_source"] == "opt_mle"
+    assert diagnostics["estimate_status"] == "interior"
+    assert diagnostics["rate_units"] == "per_site_per_generation"
+    assert diagnostics["ts_converter"] == "fake"

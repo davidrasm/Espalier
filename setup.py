@@ -19,20 +19,25 @@ DESCRIPTION = 'Espalier is a Python package for working with discordant phylogen
 LONG_DESCRIPTION = (HERE / "README.md").read_text()
 LONG_DESC_TYPE = "text/markdown"
 
-# To add for testing???: msprime, pyvolve
 INSTALL_REQUIRES = [
-      'numpy>=2.4.3',
+      'numpy>=2.4.6',
       'DendroPy>=5.0.8',
-      'pandas>=3.0.1',
-      'tskit>=1.0.2',
-      'biopython>=1.86',
+      'pandas>=3.0.3',
+      'tskit>=1.0.3',
+      'biopython>=1.87',
       'scipy>=1.17.1',
-      'click>=8.3.1'
+      'click>=8.4.1',
 ]
 
 EXTRAS_REQUIRE = {
+      'simulation': [
+            'msprime>=1.4.2',
+            'pyvolve>=1.1.0',
+      ],
       'dev': [
-            'msprime>=1.4.1',
+            'msprime>=1.4.2',
+            'pyvolve>=1.1.0',
+            'pytest>=9.0.3',
       ],
 }
 

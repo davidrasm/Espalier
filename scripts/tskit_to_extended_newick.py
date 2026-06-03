@@ -19,6 +19,8 @@ from typing import Dict, List, Set, Tuple, Optional, Iterable
 
 import tskit
 
+from Espalier.ARGNodeTypes import RECOMBINANT_FLAG
+
 
 @dataclass(frozen=True)
 class Edge:
@@ -197,8 +199,7 @@ def convert(ts: tskit.TreeSequence,
             sample_labels[int(sid)] = str(int(sid))
 
     # Identify recombination nodes
-    recomb_flag = getattr(tskit, "NODE_IS_RECOMBINATION", 131072)
-    recomb_nodes = [i for i, n in enumerate(ts.nodes()) if n.flags & recomb_flag]
+    recomb_nodes = [i for i, n in enumerate(ts.nodes()) if n.flags & RECOMBINANT_FLAG]
     recomb_pairs = _pair_recomb_nodes(recomb_nodes)
     recomb_set = set(recomb_nodes)
 

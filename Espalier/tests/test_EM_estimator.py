@@ -10,6 +10,7 @@ from Espalier.RAxML import RAxMLRunner
 from Espalier.ARGBuilder import ARGBuilder
 from Espalier.SCARLikelihood import SCAR
 from Espalier.sim import ARGSimulator
+from Espalier.ARGNodeTypes import count_recombinant_nodes
 import Utils
 import dendropy
 from dendropy.calculate import treecompare
@@ -155,7 +156,7 @@ for sim in range(start_num,n_sims+1):
             sim_flag = False
             ts = ARGSimulator.sim_ARG(sample_size=sample_size,Ne=Ne,length=genome_length,recombination_rate=rec_rate,min_breakpoints=2)
             ts.dump(sim_path + 'recomb_placement_tables')
-            true_recomb_events = len(ts.tables.nodes.flags[ts.tables.nodes.flags==131072]) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
+            true_recomb_events = count_recombinant_nodes(ts.tables.nodes.flags) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
             discordant_recomb_events = ARGSimulator.count_topo_changes(ts)
             breaks = ts.breakpoints(as_array=True)
             segments = len(breaks) - 1 # number of non-recombinant segments between breakpoints
@@ -253,7 +254,7 @@ for sim in range(start_num,n_sims+1):
             
         else:
             
-            #inferred_recomb_events = len(ts_est.tables.nodes.flags[ts_est.tables.nodes.flags==131072]) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
+            #inferred_recomb_events = count_recombinant_nodes(ts_est.tables.nodes.flags) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
             results = {'Simulation':sim,
                        'True Rec Rate':rec_rate,
                        'Rec Rate Estimate':rec_rate_est,
@@ -269,6 +270,5 @@ for sim in range(start_num,n_sims+1):
                 results_df = results_df.append(results, ignore_index=True)
 
     results_df.to_csv(results_file,index=False)
-            
-            
-            
+
+

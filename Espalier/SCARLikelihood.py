@@ -14,6 +14,8 @@ import numpy as np
 from scipy.linalg import expm
 from scipy.optimize import minimize_scalar
 
+from Espalier.ARGNodeTypes import classify_node_flags, is_recombinant
+
 class SCAR(object):
     
     """
@@ -24,6 +26,10 @@ class SCAR(object):
         But all children must have one and only one parent.
     """
     
+    rate_model_name = "uniform_site"
+    rate_units = "per_site_per_generation"
+    rate_display_units = "per site per generation"
+
     def __init__(self,rec_rate,M,Ne,genome_length,**kwargs):
         
         '''             
@@ -49,6 +55,9 @@ class SCAR(object):
         self.bounds = kwargs.get('bounds', (0, np.inf))
         self.dt_step = kwargs.get('dt_step', 0.1)
         self.known_ancestral_states = kwargs.get('known_ancestral_states', False)
+        self.last_opt_result = None
+        self.last_rate_estimate_status = None
+        self.last_likelihood_diagnostics = None
         
     def compute_neg_log_like(self,rec_rate,ts):
         
@@ -63,6 +72,26 @@ class SCAR(object):
                 
         """
     
+        self.last_likelihood_diagnostics = {
+            "status": "running",
+            "rate": float(rec_rate),
+            "observed_recombination_events": 0,
+            "zero_recomb_opportunity_events": 0,
+            "recomb_exposure": 0.0,
+            "first_nonfinite_event": None,
+        }
+
+        if rec_rate < 0 or not np.isfinite(rec_rate):
+            self._record_nonfinite_likelihood(
+                reason="invalid_rate",
+                order_idx=None,
+                node_id=None,
+                event=None,
+                event_type=None,
+                event_prob=None,
+            )
+            return np.inf
+
         pops = ts.num_populations
         if pops == 0: # we never assigned populations
             pops = 1
@@ -85,43 +114,39 @@ class SCAR(object):
         line_state_probs = [] # lineage state probabilities for active lines
         log_like = 0.0 # log likelihood of full tree
         
-        # Iterate through each event/node in ARG TreeSequence working backwards through time
-        for idx, event in enumerate(ts.tables.nodes):
+        node_times = np.array(ts.tables.nodes.time, ndmin=1)
+        node_order = np.lexsort((np.arange(len(node_times)), node_times))
+
+        # Iterate through each event/node in the ARG working backwards through time.
+        # Node IDs are stable, but tskit does not require node-table rows to be time-sorted.
+        for order_idx, idx in enumerate(node_order):
+            idx = int(idx)
+            event = ts.tables.nodes[idx]
             
             # Get time of event and time of next event"
             event_time = event.time
-            if (idx+1 < len(ts.tables.nodes)): # if not at final event
-                next_time = ts.tables.nodes[idx+1].time
+            if (order_idx + 1 < len(node_order)): # if not at final event
+                next_time = ts.tables.nodes[int(node_order[order_idx + 1])].time
             else:
                 next_time = event.time
             t_elapsed = next_time - event_time # time elapsed between events
             
 
-            # Determine event type from tskit event.flags
-            event_type = None
-            if event.flags == 1:
-                event_type = 'sample'
-            if event.flags == 0:
-                event_type = 'coalescent'
-            if event.flags == 131072:
-                event_type = 'recombination'
-            if event.flags == 262144:
-                event_type = 'hidden_coalescent'
-            if event.flags == 524288:
-                event_type = 'migration'
+            # Determine event type from tskit/msprime node flags.
+            event_type = classify_node_flags(event.flags)
             
-            # Initialize prob of observing events or no events
+            # Initialize prob of observing events and log-probs of no events.
             event_prob = 1.0
-            prob_no_coal = 1.0
-            prob_no_mig = 1.0
-            prob_no_recomb = 1.0
+            log_no_coal = 0.0
+            log_no_mig = 0.0
+            log_no_recomb = 0.0
             
             # Update active lineages based on event type: coalescent/sampling/migration events
             if 'sample' == event_type:
                 
                 # Add sampled lineage
                 active_lines.append(idx)
-                active_rec_links.append(self._get_line_links(idx,children,rights,lefts))
+                active_rec_links.append(self._get_line_recomb_opportunities(idx,children,rights,lefts))
                 state_probs = np.zeros(pops)
                 if event.population == -1: # we never assigned populations
                     state_probs[0] = 1.0 # set prob to 1.0 for sampled state
@@ -141,31 +166,35 @@ class SCAR(object):
                 # Find coal_children in active_lines
                 coal_children = [x for x in coal_children if x in active_lines]
                 child_indexes = [active_lines.index(x) for x in coal_children]
-                
-                # Compute coalescent event prob for arbitrary number of children 
-                coal_probs = np.ones(pops)
-                for child_idx in child_indexes:
-                    coal_probs *= line_state_probs[child_idx]
-                coal_probs = coal_probs / self.Ne
-                lambda_sum = sum(coal_probs)
-                event_prob = lambda_sum
-                
-                # Compute new parent state probs
-                if self.known_ancestral_states:
-                    parent_probs = np.zeros(pops)
-                    parent_probs[event.population] = 1.0
+
+                if len(child_indexes) == 0:
+                    event_prob = 1.0
+                    coal_children = []
                 else:
-                    parent_probs = coal_probs / lambda_sum # renormalize probs
-                    
-                # Update lineage arrays - overwriting child1 with parent
-                active_lines[child_indexes[0]] = idx # name of parent
-                active_rec_links[child_indexes[0]] = self._get_line_links(idx,children,rights,lefts)
-                line_state_probs[child_indexes[0]] = parent_probs
-                child_indexes.pop(0) # remove first index given to parent
-                for child_idx in sorted(child_indexes, reverse=True): # remove in reverse order so indexes don't change
-                    del active_lines[child_idx]
-                    del active_rec_links[child_idx]
-                    del line_state_probs[child_idx]
+                    # Compute coalescent event prob for arbitrary number of children
+                    coal_probs = np.ones(pops)
+                    for child_idx in child_indexes:
+                        coal_probs *= line_state_probs[child_idx]
+                    coal_probs = coal_probs / self.Ne
+                    lambda_sum = sum(coal_probs)
+                    event_prob = lambda_sum
+
+                    # Compute new parent state probs
+                    if self.known_ancestral_states:
+                        parent_probs = np.zeros(pops)
+                        parent_probs[event.population] = 1.0
+                    else:
+                        parent_probs = coal_probs / lambda_sum # renormalize probs
+
+                    # Update lineage arrays - overwriting child1 with parent
+                    active_lines[child_indexes[0]] = idx # name of parent
+                    active_rec_links[child_indexes[0]] = self._get_line_recomb_opportunities(idx,children,rights,lefts)
+                    line_state_probs[child_indexes[0]] = parent_probs
+                    child_indexes.pop(0) # remove first index given to parent
+                    for child_idx in sorted(child_indexes, reverse=True): # remove in reverse order so indexes don't change
+                        del active_lines[child_idx]
+                        del active_rec_links[child_idx]
+                        del line_state_probs[child_idx]
             
             if 'hidden_coalescent' == event_type:
                 
@@ -173,32 +202,37 @@ class SCAR(object):
                 
                 coal_children = children[parents == idx]
                 coal_children = np.unique(coal_children)
-                child1 = coal_children[0]
-                child2 = coal_children[1]
-                child1_idx = active_lines.index(child1)
-                child2_idx = active_lines.index(child2)
-                
-                # Compute likelihood of coalescent event
-                p1 = line_state_probs[child1_idx]
-                p2 = line_state_probs[child2_idx]
-                coal_probs = (p1 * p2) / self.Ne
-                lambda_sum = sum(coal_probs)
-                event_prob = lambda_sum
-                
-                # Compute new parent state probs"
-                if self.known_ancestral_states:
-                    parent_probs = np.zeros(pops)
-                    parent_probs[event.population] = 1.0
+                coal_children = [x for x in coal_children if x in active_lines]
+                if len(coal_children) < 2:
+                    event_prob = 1.0
+                    coal_children = []
                 else:
-                    parent_probs = coal_probs / lambda_sum
-                
-                # Update lineage arrays - overwriting child1 with parent"
-                active_lines[child1_idx] = idx # name of parent
-                active_rec_links[child1_idx] = self._get_line_links(idx,children,rights,lefts)
-                line_state_probs[child1_idx] = parent_probs
-                del active_lines[child2_idx]
-                del active_rec_links[child2_idx]
-                del line_state_probs[child2_idx]
+                    child1 = coal_children[0]
+                    child2 = coal_children[1]
+                    child1_idx = active_lines.index(child1)
+                    child2_idx = active_lines.index(child2)
+
+                    # Compute likelihood of coalescent event
+                    p1 = line_state_probs[child1_idx]
+                    p2 = line_state_probs[child2_idx]
+                    coal_probs = (p1 * p2) / self.Ne
+                    lambda_sum = sum(coal_probs)
+                    event_prob = lambda_sum
+
+                    # Compute new parent state probs"
+                    if self.known_ancestral_states:
+                        parent_probs = np.zeros(pops)
+                        parent_probs[event.population] = 1.0
+                    else:
+                        parent_probs = coal_probs / lambda_sum
+
+                    # Update lineage arrays - overwriting child1 with parent"
+                    active_lines[child1_idx] = idx # name of parent
+                    active_rec_links[child1_idx] = self._get_line_recomb_opportunities(idx,children,rights,lefts)
+                    line_state_probs[child1_idx] = parent_probs
+                    del active_lines[child2_idx]
+                    del active_rec_links[child2_idx]
+                    del line_state_probs[child2_idx]
             
             if "recombination" == event_type:
                 
@@ -209,7 +243,10 @@ class SCAR(object):
                 # Find child of parent node
                 child = children[parents == idx]
                 child = np.unique(child)
-                assert len(child) == 1
+                if len(child) != 1:
+                    child = None
+                else:
+                    child = int(child[0])
                 
                 # Remember that child may have already been removed from active_lines
                 if child in active_lines:
@@ -221,59 +258,70 @@ class SCAR(object):
                     recomb_parents = np.unique(recomb_parents)
                     
                     # Make sure recombination event results in a child splitting into two parents"
-                    recomb_parents = [x for x in recomb_parents if ts.tables.nodes[x].flags == 131072] # have to be recombination event
-                    assert len(recomb_parents) == 2
-                    
-                    # Get parents
-                    left_parent = recomb_parents[0]
-                    right_parent = recomb_parents[1]
-        
-                    child_idx = active_lines.index(child)
-                    
-                    # Compute recombination event prob
-                    links = active_rec_links[child_idx] # Links gives num of sites at which lineage carries material ancestral to the sample
-                    event_prob = rec_rate * links
-                    
-                    # Compute new parent state probs
-                    if self.known_ancestral_states:
-                        parent_probs = np.zeros(pops)
-                        parent_probs[event.population] = 1.0
+                    recomb_parents = [x for x in recomb_parents if is_recombinant(ts.tables.nodes[x].flags)]
+                    if len(recomb_parents) != 2:
+                        event_prob = 1.0
+                        recomb_parents = []
                     else:
-                        parent_probs = line_state_probs[child_idx]
-                    
-                    # Update lineage arrays - overwriting child with left parent"
-                    active_lines[child_idx] = left_parent # name of parent
-                    active_rec_links[child_idx] = self._get_line_links(left_parent,children,rights,lefts)
-                    line_state_probs[child_idx] = parent_probs
-                    
-                    # Add other recombining parent
-                    active_lines.append(right_parent)
-                    active_rec_links.append(self._get_line_links(right_parent,children,rights,lefts))
-                    line_state_probs.append(parent_probs)
+                        # Get parents
+                        left_parent = recomb_parents[0]
+                        right_parent = recomb_parents[1]
+
+                        child_idx = active_lines.index(child)
+
+                        # Compute recombination event prob
+                        links = active_rec_links[child_idx] # Links gives num of sites at which lineage carries material ancestral to the sample
+                        self.last_likelihood_diagnostics["observed_recombination_events"] += 1
+                        if links <= 0:
+                            self.last_likelihood_diagnostics["zero_recomb_opportunity_events"] += 1
+                        event_prob = rec_rate * links
+
+                        # Compute new parent state probs
+                        if self.known_ancestral_states:
+                            parent_probs = np.zeros(pops)
+                            parent_probs[event.population] = 1.0
+                        else:
+                            parent_probs = line_state_probs[child_idx]
+
+                        # Update lineage arrays - overwriting child with left parent"
+                        active_lines[child_idx] = left_parent # name of parent
+                        active_rec_links[child_idx] = self._get_line_recomb_opportunities(left_parent,children,rights,lefts)
+                        line_state_probs[child_idx] = parent_probs
+
+                        # Add other recombining parent
+                        active_lines.append(right_parent)
+                        active_rec_links.append(self._get_line_recomb_opportunities(right_parent,children,rights,lefts))
+                        line_state_probs.append(parent_probs)
             
             if 'migration' == event_type:
                 
                 # Find migrating (child) lineage
                 mig_child = children[parents == idx] # parent has id == idx in parent column of edges table
                 mig_child = np.unique(mig_child)
-                
-                # Get migration info from nodes list
-                curr_state = populations[mig_child[0]]
-                new_state = populations[idx]
-                
-                migrant_idx = active_lines.index(mig_child) #change this for ts index
-                
-                # Update lineage arrays
-                active_lines[migrant_idx] = idx # name of parent
-                
-                # Compute event prob
-                if self.known_ancestral_states:
-                    new_probs = np.zeros(pops)
-                    new_probs[new_state] = 1.0 # event. population
-                    line_state_probs[migrant_idx] = new_probs
-                    event_prob = self.M[curr_state][new_state]
+                if len(mig_child) == 0:
+                    event_prob = 1.0
                 else:
-                    event_prob = 1.0 # pretend as if we don't see migration events
+                    mig_child = int(mig_child[0])
+                    if mig_child not in active_lines:
+                        event_prob = 1.0
+                    else:
+                        # Get migration info from nodes list
+                        curr_state = populations[mig_child]
+                        new_state = populations[idx]
+
+                        migrant_idx = active_lines.index(mig_child) #change this for ts index
+
+                        # Update lineage arrays
+                        active_lines[migrant_idx] = idx # name of parent
+
+                        # Compute event prob
+                        if self.known_ancestral_states:
+                            new_probs = np.zeros(pops)
+                            new_probs[new_state] = 1.0 # event. population
+                            line_state_probs[migrant_idx] = new_probs
+                            event_prob = self.M[curr_state][new_state]
+                        else:
+                            event_prob = 1.0 # pretend as if we don't see migration events
                             
             # Compute prob of no coalescent over time interval
             if not np.isclose(t_elapsed, 0):
@@ -287,31 +335,30 @@ class SCAR(object):
                     # Compute prob of no coalescent over time interval
                     pairs = (A * (A-1)) / 2 # number of pairs in each pop
                     lambdas =  pairs * (1/self.Ne) # coal rate in each pop   
-                    prob_no_coal = np.exp(-np.sum(lambdas)*t_elapsed)
+                    log_no_coal = -np.sum(lambdas) * t_elapsed
                 
                     # Compute prob of no migration over the time interval
                     sam = 0
                     for i in range(pops):
                         for z in range(pops):
                             sam += (A[i])*(self.M[i][z])
-                    prob_no_mig = np.exp(-sam*t_elapsed)
+                    log_no_mig = -sam * t_elapsed
                     
                     # Compute prob of no recombination event over the time interval
                     # Links are computed per population b/c we are assuming recombination can only happen in same pop
-                    line_prod = np.array(line_state_probs) * np.array(active_rec_links)[:, np.newaxis]
-                    sum_links = np.sum(np.sum(line_prod))
-                              
-                    prob_no_recomb = np.exp(-sum_links * rec_rate * t_elapsed) # assumes rho / genome_length is constant across pops
+                    sum_links = self._sum_active_recomb_opportunities(line_state_probs, active_rec_links)
+                    self.last_likelihood_diagnostics["recomb_exposure"] += float(sum_links * t_elapsed)
+                    log_no_recomb = -sum_links * rec_rate * t_elapsed # assumes rho / genome_length is constant across pops
                     
                 else: # Unknown ancestral lineage states
                 
                     # Integrate lineage prob equations backwards
                     dt_times = list(np.arange(event_time,next_time,self.dt_step)) # integration steps going backwards in time
-                    for idx,tx in enumerate(dt_times):
+                    for step_idx,tx in enumerate(dt_times):
                         
                         # Get time step
-                        if (idx+1 < len(dt_times)):
-                            dt = dt_times[idx+1] - tx # integration time step
+                        if (step_idx+1 < len(dt_times)):
+                            dt = dt_times[step_idx+1] - tx # integration time step
                         else:
                             dt = next_time - tx
     
@@ -330,24 +377,102 @@ class SCAR(object):
                         pairs = (A * (A-1)) / 2 # number of pairs in each pop
                         pairs = pairs.clip(min=0) # make sure non are negative
                         lambdas = pairs * (1/self.Ne) # coal rate in each pop
-                        prob_no_coal *= np.exp(-np.sum(lambdas)*dt)
+                        log_no_coal += -np.sum(lambdas) * dt
                         
                         # Compute prob of no migration over the time interal"
-                        prob_no_mig = 1.0
+                        log_no_mig = 0.0
                         
                         # Compute prob of no recombination event over the time interval
                         # Links are computed per population b/c we are assuming recombination can only happen in same pop
-                        line_prod = np.array(line_state_probs) * np.array(active_rec_links)[:, np.newaxis]
-                        sum_links = np.sum(np.sum(line_prod))
-                                            
-                        prob_no_recomb *= np.exp(-sum_links * rec_rate * dt)
+                        sum_links = self._sum_active_recomb_opportunities(line_state_probs, active_rec_links)
+                        self.last_likelihood_diagnostics["recomb_exposure"] += float(sum_links * dt)
+                        log_no_recomb += -sum_links * rec_rate * dt
             
-            log_like += np.log(event_prob) + np.log(prob_no_coal) + np.log(prob_no_mig) + np.log(prob_no_recomb)
+            log_terms = [log_no_coal, log_no_mig, log_no_recomb]
+            if event_prob <= 0 or not np.isfinite(event_prob):
+                self._record_nonfinite_likelihood(
+                    reason="nonpositive_event_probability",
+                    order_idx=order_idx,
+                    node_id=idx,
+                    event=event,
+                    event_type=event_type,
+                    event_prob=event_prob,
+                )
+                return np.inf
+            if not all(np.isfinite(term) for term in log_terms):
+                self._record_nonfinite_likelihood(
+                    reason="nonfinite_waiting_time_probability",
+                    order_idx=order_idx,
+                    node_id=idx,
+                    event=event,
+                    event_type=event_type,
+                    event_prob=event_prob,
+                    log_no_coal=log_no_coal,
+                    log_no_mig=log_no_mig,
+                    log_no_recomb=log_no_recomb,
+                )
+                return np.inf
+            log_like += np.log(event_prob) + log_no_coal + log_no_mig + log_no_recomb
+            if not np.isfinite(log_like):
+                self._record_nonfinite_likelihood(
+                    reason="nonfinite_log_likelihood",
+                    order_idx=order_idx,
+                    node_id=idx,
+                    event=event,
+                    event_type=event_type,
+                    event_prob=event_prob,
+                    log_no_coal=log_no_coal,
+                    log_no_mig=log_no_mig,
+                    log_no_recomb=log_no_recomb,
+                )
+                return np.inf
             
+        self.last_likelihood_diagnostics["status"] = "finite"
+        self.last_likelihood_diagnostics["neg_log_likelihood"] = float(-log_like)
         return -log_like
 
+    def _sum_active_recomb_opportunities(self, line_state_probs, active_rec_links):
+        if not active_rec_links:
+            return 0.0
+        line_prod = np.array(line_state_probs) * np.array(active_rec_links)[:, np.newaxis]
+        return float(np.sum(np.sum(line_prod)))
 
-    def _get_line_links(self,line,children,rights,lefts):
+    def _record_nonfinite_likelihood(
+        self,
+        reason,
+        order_idx,
+        node_id,
+        event,
+        event_type,
+        event_prob,
+        log_no_coal=None,
+        log_no_mig=None,
+        log_no_recomb=None,
+    ):
+        if self.last_likelihood_diagnostics is None:
+            self.last_likelihood_diagnostics = {}
+        self.last_likelihood_diagnostics["status"] = "nonfinite"
+        self.last_likelihood_diagnostics["nonfinite_reason"] = reason
+        if event is None:
+            event_details = None
+        else:
+            event_details = {
+                "order_idx": int(order_idx),
+                "node_id": int(node_id),
+                "time": float(event.time),
+                "flags": int(event.flags),
+                "event_type": event_type,
+                "event_prob": float(event_prob) if event_prob is not None else None,
+            }
+            if log_no_coal is not None:
+                event_details["log_no_coal"] = float(log_no_coal)
+            if log_no_mig is not None:
+                event_details["log_no_mig"] = float(log_no_mig)
+            if log_no_recomb is not None:
+                event_details["log_no_recomb"] = float(log_no_recomb)
+        self.last_likelihood_diagnostics["first_nonfinite_event"] = event_details
+
+    def _get_line_recomb_opportunities(self,line,children,rights,lefts):
         
         """
             Compute the number of sites (links) ancestral to the sample and thus eligible to undergo recombination
@@ -357,7 +482,7 @@ class SCAR(object):
         if len(children[children==line])==1:
             line_links = (rights[children==line] - lefts[children==line])[0] - 1
         elif len(children[children==line])>=2:
-            line_links = max(rights[children==line]) - min(lefts[children==line]) - 1 
+            line_links = max(rights[children==line]) - min(lefts[children==line]) - 1
             
         return line_links
     
@@ -371,8 +496,71 @@ class SCAR(object):
         # Optimize likelihood by minimizing negative log likelihood
         res = minimize_scalar(self.compute_neg_log_like, args=(ts), bounds=self.bounds, method='bounded')
         mle = res.x
-    
+        res.fun = self.compute_neg_log_like(mle, ts)
+        self.last_opt_result = res
+        if not np.isfinite(res.fun):
+            self.last_rate_estimate_status = "nonfinite_likelihood"
+        else:
+            self.last_rate_estimate_status = self._classify_rate_estimate(mle)
+
         return mle
+
+    def _classify_rate_estimate(self, rate):
+
+        """
+            Classify whether an optimized rate estimate is at a bound or in the interior.
+        """
+
+        lower, upper = self.bounds
+        span = upper - lower if np.isfinite(lower) and np.isfinite(upper) else max(abs(rate), 1.0)
+        tol = max(1e-12, span * 1e-3)
+
+        if np.isfinite(lower) and rate <= lower + tol:
+            return "hit_lower_bound"
+        if np.isfinite(upper) and rate >= upper - tol:
+            return "hit_upper_bound"
+        return "interior"
+
+
+class BoundarySCAR(SCAR):
+
+    """
+        SCAR variant for segmented reassortment where recombination is only possible
+        at predefined segment boundaries rather than uniformly at every genomic link.
+    """
+
+    rate_model_name = "boundary_hotspot"
+    rate_units = "per_boundary_per_generation"
+    rate_display_units = "per boundary per generation"
+
+    def __init__(self, rec_rate, M, Ne, genome_length, boundary_positions, **kwargs):
+        self.boundary_positions = sorted(int(position) for position in boundary_positions)
+        self.n_boundaries = len(self.boundary_positions)
+        super().__init__(rec_rate, M, Ne, genome_length, **kwargs)
+
+    def _get_line_recomb_opportunities(self, line, children, rights, lefts):
+
+        """
+            Count configured segment boundaries that remain eligible for reassortment
+            on a lineage's ancestral material.
+        """
+
+        line_mask = children == line
+        if not np.any(line_mask):
+            return 0
+
+        intervals = [
+            (left, right)
+            for left, right in zip(lefts[line_mask], rights[line_mask])
+            if right > left
+        ]
+        eligible = 0
+        for boundary in self.boundary_positions:
+            carries_left_side = any(left < boundary <= right for left, right in intervals)
+            carries_right_side = any(left <= boundary < right for left, right in intervals)
+            if carries_left_side and carries_right_side:
+                eligible += 1
+        return eligible
 
 if __name__ == '__main__':
        
@@ -405,4 +593,3 @@ if __name__ == '__main__':
     
     # Check likelihood is valid
     #L = compute_like(ts,**params)
-

@@ -3,14 +3,16 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11.*
-  - numpy=2.4.3
+  - numpy=2.4.6
   - scipy=1.17.1
   - matplotlib
-  - pandas=3.0.1
+  - pandas=3.0.3
   - seaborn
   - spyder
-  - biopython=1.86
+  - biopython=1.87
   - dendropy=5.0.8
-  - tskit=1.0.2
-  - click=8.3.1
-  - msprime=1.4.1
+  - tskit=1.0.3
+  - click=8.4.1
+  - msprime=1.4.2
+  - pyvolve=1.1.0
+  - pytest=9.0.3

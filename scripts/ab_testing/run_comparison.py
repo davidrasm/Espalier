@@ -40,6 +40,7 @@ from Espalier.Reconciler import Reconciler
 from Espalier.RAxML import RAxMLRunner
 from Espalier.SCARLikelihood import SCAR
 from Espalier import Utils
+from Espalier.ARGNodeTypes import count_recombination_events
 
 from ab_testing.modern_converter import (
     convert_modern,
@@ -248,8 +249,7 @@ def compute_likelihood(ts, scar_model: SCAR) -> Optional[float]:
 
         # For now, return number of recombination events as a proxy
         # (proper likelihood requires full SCAR implementation)
-        recomb_nodes = np.sum(ts.tables.nodes.flags == 131072)
-        n_recomb = recomb_nodes // 2
+        n_recomb = count_recombination_events(ts)
 
         # Simple likelihood proxy based on recombination rate and count
         rec_rate = scar_model.rec_rate
