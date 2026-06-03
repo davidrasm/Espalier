@@ -17,6 +17,7 @@ from operator import attrgetter
 from collections import namedtuple
 import os
 import shutil
+from Espalier.ARGNodeTypes import is_recombinant
 
 def add_rec_node(tree,attachment_edge,recomb_time,midpoint=False):
     
@@ -254,7 +255,7 @@ def add_recombinant_ts_edges(tree,ts):
 
     recomb_edges = []
     for node_id, node in enumerate(ts.tables.nodes):
-        if node.flags == 131072: # if recombination flag
+        if is_recombinant(node.flags): # if recombination flag
             "Find row(s) in edge table"
             for edge_idx in edge_ids[edge_parents == node_id]:
                 edge_left = ts.tables.edges[edge_idx].left
@@ -352,4 +353,3 @@ if write_tree_path:
     for loc, tree in enumerate(tree_path):
         tree_file = tree_files[loc].replace('tree','PathTree')
         tree.write(path=tree_file,schema='newick',suppress_annotations=True,suppress_rooting=True)
-

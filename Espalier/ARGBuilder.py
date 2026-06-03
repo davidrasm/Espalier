@@ -17,6 +17,7 @@ from Espalier.Viterbi import viterbi
 from Espalier.Reconciler import ReconciledTree
 from Espalier import Dendro2TSConverter
 from Espalier import Utils
+from Espalier.ARGNodeTypes import summarize_recombination_events
 import dendropy
 import numpy as np
 from scipy.stats import poisson
@@ -158,6 +159,9 @@ class ARGBuilder(object):
                 true_trees: true local trees -- only used for debugging
                 report (boolean): prints report logging performance if True
                 min_rec_rate (float): threshold for minimum allowable recombination rate estimated in maximization step
+                return_tree_path (boolean): include the tree path with recombination nodes in the return value
+                return_diagnostics (boolean): include EM estimation diagnostics in the return value
+                ts_converter (callable): converts (tree_path, tree_intervals) to a TreeSequence
                
             Returns:     
                tree_path (list): Tree path containing local trees in ARG
@@ -172,9 +176,33 @@ class ARGBuilder(object):
         # Or initialize in __init__?
         report = kwargs.get('report', None)
         true_trees = kwargs.get('true_trees', None)
+        return_tree_path = kwargs.get('return_tree_path', False)
+        return_diagnostics = kwargs.get('return_diagnostics', False)
+        ts_converter = kwargs.get('ts_converter', None)
+        ts_converter_name = kwargs.get('ts_converter_name', None)
+        if ts_converter is None:
+            try:
+                from Espalier.ModernDendro2TSConverter import convert as ts_converter
+                ts_converter_name = ts_converter_name or "modern"
+            except ImportError:
+                ts_converter = Dendro2TSConverter.convert
+                ts_converter_name = ts_converter_name or "legacy"
+        else:
+            ts_converter_name = ts_converter_name or getattr(ts_converter, "__name__", "custom")
         
         # Get initial rec_rate from coal_model
-        rec_rate = coal_model.rec_rate # recombination rate per site
+        rec_rate = coal_model.rec_rate
+
+        # Initialize ts to None (will be set if conversion succeeds)
+        ts = None
+        inferred_recomb_events = 0
+        last_successful_ts = None
+        last_successful_recomb_events = 0
+        last_tree_path = None  # Store the last tree path with recombination nodes
+        rate_estimate_source = "unestimated"
+        rate_estimate_status = None
+        ts_conversion_failures_total = 0
+        used_last_successful_ts = False
         
         # Get genomic segment info for each genomic region
         self._get_genome_segments(seq_files)
@@ -240,10 +268,15 @@ class ARGBuilder(object):
                     # Add required rec nodes to trees in path
                     logging.info("Adding recombination events to trees in path")
                     tree_path, total_recs_added = add_path_rec_nodes(tree_path)
-                    
+
+                    # Store tree path with recombination nodes (even if TS conversion fails)
+                    last_tree_path = [t.clone(depth=2) for t in tree_path]
+
                     # Convert tree path with recombination nodes to tskit TreeSequence
-                    ts = Dendro2TSConverter.convert(tree_path,tree_intervals)
-                    inferred_recomb_events = len(ts.tables.nodes.flags[ts.tables.nodes.flags==131072]) / 2 # number of recomb nodes divided by two since each is present twice in nodes tables
+                    converter_result = ts_converter(tree_path, tree_intervals)
+                    ts = converter_result[0] if isinstance(converter_result, tuple) else converter_result
+                    recomb_summary = summarize_recombination_events(ts)
+                    inferred_recomb_events = recomb_summary["n_events"]
                     
                     ###
                         # Maximization step: find params that optimize likelihood
@@ -252,17 +285,22 @@ class ARGBuilder(object):
                     logging.info("Maximization step: Optimizing model params")
                     rec_rate = coal_model.opt_MLE(ts)
                     rec_rate_samples.append(rec_rate)
+                    rate_estimate_source = "opt_mle"
+                    rate_estimate_status = getattr(coal_model, "last_rate_estimate_status", "interior")
                     logging.info("Recombination rate estimate: %s", f'{rec_rate:.6f}')
                                 
-                except Exception as e: 
-                    
+                except Exception as e:
+
                     print(e)
                     failed_attempts += 1
-                
+
                 else:
-                    
+
                     step_completed = True
-                    
+                    # Store the last successful ts
+                    last_successful_ts = ts
+                    last_successful_recomb_events = inferred_recomb_events
+
                 finally:
                                    
                     if failed_attempts == max_attempts:
@@ -277,11 +315,59 @@ class ARGBuilder(object):
                         inferred_recomb_events = total_recs_added / 2 # number of recomb events divided by two since each event is added twice
                         tree_lengths = [tr.length() for tr in tree_path]
                         mean_tree_length = np.mean(tree_lengths)
-                        rec_rate_per_genome = inferred_recomb_events / mean_tree_length
-                        rec_rate = rec_rate_per_genome / coal_model.genome_length
+                        if getattr(coal_model, "rate_units", None) == "per_boundary_per_generation":
+                            total_opportunities = max(getattr(coal_model, "n_boundaries", 0), 1)
+                            rec_rate = inferred_recomb_events / (mean_tree_length * total_opportunities)
+                        else:
+                            rec_rate_per_genome = inferred_recomb_events / mean_tree_length
+                            rec_rate = rec_rate_per_genome / coal_model.genome_length
                         rec_rate = max(min_rec_rate, rec_rate)
+                        rate_estimate_source = "fallback_tree_length"
+                        rate_estimate_status = "fallback"
                         logging.info("Recombination rate estimate: %s", f'{rec_rate:.6f}')
-                                
+
+            ts_conversion_failures_total += failed_attempts
+
+        # Return the last successful ts if current ts is None
+        if ts is None and last_successful_ts is not None:
+            logging.info("Using last successful TreeSequence from earlier EM iteration")
+            ts = last_successful_ts
+            inferred_recomb_events = last_successful_recomb_events
+            used_last_successful_ts = True
+
+        diagnostics = {
+            "estimate_source": rate_estimate_source,
+            "estimate_status": rate_estimate_status,
+            "ts_conversion_failures": ts_conversion_failures_total,
+            "used_last_successful_ts": used_last_successful_ts,
+            "rate_model_name": getattr(coal_model, "rate_model_name", "unknown"),
+            "rate_units": getattr(coal_model, "rate_units", "unknown"),
+            "rate_display_units": getattr(coal_model, "rate_display_units", "unknown"),
+            "opt_bounds": list(getattr(coal_model, "bounds", ())),
+            "ts_converter": ts_converter_name,
+        }
+        if ts is not None:
+            recomb_summary = summarize_recombination_events(ts)
+            diagnostics["structural_recombination_events"] = recomb_summary["n_events"]
+            diagnostics["recombinant_nodes"] = recomb_summary["n_recomb_nodes"]
+            diagnostics["unpaired_recombinant_nodes"] = recomb_summary["unpaired_recomb_node_ids"]
+            diagnostics["unpaired_recombinant_node_count"] = len(
+                recomb_summary["unpaired_recomb_node_ids"]
+            )
+        if getattr(coal_model, "last_opt_result", None) is not None:
+            diagnostics["opt_success"] = bool(coal_model.last_opt_result.success)
+            diagnostics["opt_nfev"] = int(coal_model.last_opt_result.nfev)
+            opt_fun = float(coal_model.last_opt_result.fun)
+            diagnostics["opt_fun"] = opt_fun if np.isfinite(opt_fun) else None
+        if getattr(coal_model, "last_likelihood_diagnostics", None) is not None:
+            diagnostics["likelihood_diagnostics"] = coal_model.last_likelihood_diagnostics
+
+        if return_tree_path:
+            if return_diagnostics:
+                return ts, rec_rate, inferred_recomb_events, last_tree_path, diagnostics
+            return ts, rec_rate, inferred_recomb_events, last_tree_path
+        if return_diagnostics:
+            return ts, rec_rate, inferred_recomb_events, diagnostics
         return ts, rec_rate, inferred_recomb_events
     
     def _build_trellis(self,local_tree_files,seq_files,ref):
@@ -324,7 +410,7 @@ class ARGBuilder(object):
             
             # Get local tree for this segment"
             alt_file = local_tree_files[loc] # local tree
-            local_tree = dendropy.Tree.get(file=open(alt_file, 'r'), schema="newick", rooting="default-rooted", taxon_namespace=taxa)
+            local_tree = dendropy.Tree.get(file=open(alt_file, 'r'), schema="newick", rooting="default-rooted", taxon_namespace=taxa, preserve_underscores=True)
             #seq_file = seq_files[loc] # path + "disentangler_test1_tree" + str(loc) + ".fasta"
     
             # Get locally adapted consensus for previous segement
@@ -593,7 +679,7 @@ def add_rec_node(tree,attachment_edge,recomb_time,midpoint=False):
     return tree
 
 
-def find_recombinant_edge(tree,subtree_taxa):
+def find_recombinant_edge(tree,subtree_taxa,recomb_time=None):
     
     """
         Find edge where subtree attaches in tree
@@ -601,30 +687,47 @@ def find_recombinant_edge(tree,subtree_taxa):
         TODO: Move to Reconciler or TreeOps?
     """
     
-    # Find edge where subtree attaches in alt tree 
-    # Note: this will be the parent of the first edge that includes all subtree_taxa in its leaf set"
-    for edge in tree.postorder_edge_iter():
-        edge_taxa = set([lf.taxon.label for lf in edge.head_node.leaf_iter()])
-        if subtree_taxa.issubset(edge_taxa): # subtree_taxa are subset of all edge_taxa
-            break
-    
-    attachment_edge = edge
-    parent_node = edge.tail_node # parent of recombinant/attachment edge
-    child_node = edge.head_node # child of recombinant edge
-    child_nodes = parent_node.child_nodes()
-    #if len(child_nodes) < 2:
-        #print('WTF!') # I think this can only happen if we've already added a recombination node as a unifurcation
-    
-    # TODO: can remove this since sibling nodes no longer place constraints on recombination event time
-    #if child_nodes[0] is child_node:
-    #    sibling_node = child_nodes[1]
-    #else:
-    #    sibling_node = child_nodes[0]
-    
-    # Find constraints on timing of recomb event
     tree.calc_node_ages(ultrametricity_precision=False)
-    parent_time = parent_node.age # max recombination time is height/age of parent node
-    child_time = child_node.age
+
+    # Find edge where subtree attaches. If a recombination time is provided,
+    # prefer the current edge segment that brackets that time; this avoids
+    # ambiguous split-bitmask lookups after unary recombination nodes are added.
+    candidates = []
+    for order_idx, edge in enumerate(tree.postorder_edge_iter()):
+        if edge.head_node is None:
+            continue
+        edge_taxa = set([lf.taxon.label for lf in edge.head_node.leaf_iter()])
+        if not subtree_taxa.issubset(edge_taxa):
+            continue
+
+        parent_node = edge.tail_node
+        child_node = edge.head_node
+        child_time = child_node.age
+        if parent_node is None:
+            parent_time = child_time + (edge.length or 0.0)
+        else:
+            parent_time = parent_node.age
+        extra_taxa = len(edge_taxa) - len(subtree_taxa)
+        if recomb_time is None:
+            candidates.append((order_idx, extra_taxa, edge, parent_time, child_time))
+        else:
+            time_violation = 0.0
+            if recomb_time > parent_time:
+                time_violation = recomb_time - parent_time
+            elif recomb_time < child_time:
+                time_violation = child_time - recomb_time
+            edge_span = max(parent_time - child_time, 0.0)
+            candidates.append(
+                (time_violation, extra_taxa, edge_span, order_idx, edge, parent_time, child_time)
+            )
+
+    if not candidates:
+        raise ValueError("Could not find attachment edge for recombinant subtree")
+
+    if recomb_time is None:
+        _, _, attachment_edge, parent_time, child_time = candidates[0]
+    else:
+        _, _, _, _, attachment_edge, parent_time, child_time = min(candidates)
 
     return attachment_edge, parent_time, child_time,
 
@@ -640,7 +743,7 @@ def find_recombination_events(ref,alt,maf,ref_rec_nodes,alt_rec_nodes):
         TODO: Should we just throw an exception here if min_recomb_time < max_recomb_time since we know the local trees are incompatible?
     """
     
-    RecNode = namedtuple('RecNode', 'edge_bitmask recomb_time')
+    RecNode = namedtuple('RecNode', 'edge_bitmask recomb_time subtree_taxa')
     
     maf.pop() # remove last/largest connected component
     for sub_tree in reversed(maf):
@@ -662,10 +765,27 @@ def find_recombination_events(ref,alt,maf,ref_rec_nodes,alt_rec_nodes):
         if max_recomb_time >= min_recomb_time:
             # Add random rec event time based on min and max allowed rec times
             recomb_time = np.random.uniform(low=min_recomb_time,high=max_recomb_time) # draw a uniform time between these constraints
-            ref_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_ref.split_bitmask, recomb_time=recomb_time))
-            alt_rec_nodes.append(RecNode(edge_bitmask=attachment_edge_alt.split_bitmask, recomb_time=recomb_time))
         else:
-            logging.warning("WARNING: Could not add recombination nodes due to time constraint violations!")
+            # Relaxed placement: use midpoint when constraints are violated
+            # This preserves topology/ancestry but may have minor time inconsistencies
+            logging.warning(f"Time constraint violation: max={max_recomb_time:.6f} < min={min_recomb_time:.6f}. "
+                          f"Using relaxed placement at midpoint.")
+            recomb_time = (min_recomb_time + max_recomb_time) / 2
+
+        ref_rec_nodes.append(
+            RecNode(
+                edge_bitmask=attachment_edge_ref.split_bitmask,
+                recomb_time=recomb_time,
+                subtree_taxa=frozenset(subtree_taxa),
+            )
+        )
+        alt_rec_nodes.append(
+            RecNode(
+                edge_bitmask=attachment_edge_alt.split_bitmask,
+                recomb_time=recomb_time,
+                subtree_taxa=frozenset(subtree_taxa),
+            )
+        )
     
     return ref_rec_nodes,alt_rec_nodes
 
@@ -695,21 +815,23 @@ def add_path_rec_nodes(tree_path):
     total_recs_added = 0
     for tree_idx, tree in enumerate(tree_path):
         
-        bipartition_dict = tree.split_bitmask_edge_map
-        
         # Sort rec_nodes in descending order by time so we add older events first
         tree_rec_nodes = rec_nodes[tree_idx]
         tree_rec_nodes = sorted(tree_rec_nodes, key=attrgetter('recomb_time'), reverse=True)
         total_recs_added += len(tree_rec_nodes)
         for rn in tree_rec_nodes:
                         
-            # Add rec event
-            rec_edge = bipartition_dict.get(rn.edge_bitmask,None)
+            # Re-resolve the edge against the current tree because previous
+            # unary recombination insertions can duplicate split bitmasks.
+            rec_edge, _, _ = find_recombinant_edge(
+                tree,
+                set(rn.subtree_taxa),
+                recomb_time=rn.recomb_time,
+            )
             tree = add_rec_node(tree,rec_edge,rn.recomb_time)
             
             # Re-encode bipartitions in case bipartitions were lost after adding rec_node
             tree.encode_bipartitions(suppress_unifurcations=False)
-            bipartition_dict = tree.split_bitmask_edge_map
             
     logging.info("Added " + str(total_recs_added) + " recombination nodes to tree path")
             
