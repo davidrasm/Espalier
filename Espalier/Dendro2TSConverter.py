@@ -16,23 +16,47 @@ import pandas as pd
 import copy
 import logging
 
-def convert(tree_path,tree_intervals):
+from Espalier.ARGNodeTypes import RECOMBINANT_FLAG, SAMPLE_FLAG, is_recombinant
+
+RECOMB_FLAG = RECOMBINANT_FLAG
+
+
+def _metadata_sort_key(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _sort_nodes_df(node_df):
+    sorted_df = node_df.copy()
+    sorted_df["_metadata_sort_key"] = sorted_df["metadata"].map(_metadata_sort_key)
+    sorted_df.sort_values(
+        ["time", "_metadata_sort_key"],
+        ignore_index=True,
+        inplace=True,
+        kind="mergesort",
+    )
+    sorted_df.drop(columns=["_metadata_sort_key"], inplace=True)
+    return sorted_df
+
+def convert(tree_path,tree_intervals,run_deep_checks=False):
     
     """
         Main conversion routine for converting tree_path with recombination events into tskit TreeSequence.
         Local trees are first converted into node and edge tables, which are sequentially merged across genome regions (segments)
         After merging, duplicate nodes/edges are removed from these tables.
-        Two checks are performed on tables to ensure a valid ARG can be constructed:
+        Two optional checks can be performed on tables to repair difficult ARGs:
         1) A "post-order" check to ensure all nodes have one and only one parent
         2) A "pre-order" check to ensure no node has more than two children
-        Additional "hidden" nodes may be added during checks to satisfy parent-child requirements
-        While these two checks are necessary to ensure a valid ARG, they are not sufficient and conversion may still fail.
+        Additional "hidden" nodes may be added during checks to satisfy parent-child requirements.
+        While these two checks can help, they are not sufficient and conversion may still fail.
         
         Important: all unifurcations in local trees will be interpreted as recombination events
         
         Parameters:     
             tree_path (list(dendropy.Tree)): tree path
-            tree_intervals (list(tuple)): list of genomic intervals for each local tree specified as a tuple (start,end) 
+            tree_intervals (list(tuple)): list of genomic intervals for each local tree specified as a tuple (start,end)
+            run_deep_checks (bool): run slower post/pre-order repairs after initial tskit validation
                  
         Returns:     
            merged_ts (tskit.TreeSequence): tree sequence representing a connected ARG
@@ -49,7 +73,8 @@ def convert(tree_path,tree_intervals):
     
     # Convert tree to node and edge dataframes
     merged_node_df, tree = tree2nodesdf(tree)
-    id_dict = dict(zip(merged_node_df['unique_id'].astype('int'), merged_node_df.index))
+    # Use Python int conversion to handle arbitrarily large bitmasks
+    id_dict = dict(zip([int(x) for x in merged_node_df['unique_id']], merged_node_df.index))
     merged_edge_df = tree2edgedf(tree,left_pos,right_pos,id_dict)
     
     logging.debug("Merging node and edge tables")
@@ -63,13 +88,13 @@ def convert(tree_path,tree_intervals):
         
         # Get node df for next tree and merge node tables
         next_node_df, tree = tree2nodesdf(tree, prev_node_df=merged_node_df)
-        merged_node_df = merged_node_df.append(next_node_df,ignore_index=True)
+        merged_node_df = pd.concat([merged_node_df, next_node_df], ignore_index=True)
         merged_node_df.drop_duplicates(ignore_index=True,inplace=True)
-        merged_node_df.sort_values('metadata', ignore_index=True, inplace=True) # first sort on metadata (sample/taxon labels)
-        merged_node_df.sort_values('time', ignore_index=True, inplace=True) # then sort on times
+        merged_node_df = _sort_nodes_df(merged_node_df)
         
         # Create dictionary to map unique ids to new tskit node ids
-        id_dict = dict(zip(merged_node_df['unique_id'].astype('int'), merged_node_df.index))
+        # Use Python int conversion to handle arbitrarily large bitmasks
+        id_dict = dict(zip([int(x) for x in merged_node_df['unique_id']], merged_node_df.index))
         
         # Reindex edge df to update parent/child ids based on mapping in id_dict
         # Explaination: Once we've merged the node tables we may have added new coalescent/recomb nodes
@@ -79,7 +104,7 @@ def convert(tree_path,tree_intervals):
         
         # Get edge df for next trees and merge edge tables
         next_edge_df = tree2edgedf(tree,left_pos,right_pos,id_dict)
-        merged_edge_df = merged_edge_df.append(next_edge_df)
+        merged_edge_df = pd.concat([merged_edge_df, next_edge_df], ignore_index=True)
         
         # Check if we can assemble TableCollection and TreeSequence after each merger
         #merged_tables = df2TreeTables(merged_edge_df,merged_node_df,total_length)
@@ -88,44 +113,70 @@ def convert(tree_path,tree_intervals):
     
     # Check to make sure all child node times are below parent times 
     #check_time_constraints(merged_edge_df,merged_node_df)
-    
+
     # Check to make sure each child has only one parent over each genomic interval
     check_parent_child_intervals(merged_edge_df,merged_node_df)
 
-    merged_tables = df2TreeTables(merged_edge_df,merged_node_df,total_length)
-    #merged_tables.sort() # squash will sort edges below
-    merged_tables.edges.squash() # squash sorts and combines "equivalent" adjacent edges
-    merged_ts = merged_tables.tree_sequence()
-    
+    # Fix any time constraint violations BEFORE creating TreeSequence
+    # (tskit requires time[parent] > time[child] for all edges)
+    merged_node_df = fix_time_constraints(merged_edge_df, merged_node_df)
+
+    # Create initial TreeSequence with retry logic for time constraint issues
+    for retry in range(3):
+        merged_tables = df2TreeTables(merged_edge_df, merged_node_df, total_length)
+        merged_tables.sort()  # Sort after time fixes to ensure proper edge ordering
+        merged_tables.edges.squash()  # squash combines "equivalent" adjacent edges
+        merged_tables.sort()  # Re-sort after squash to ensure proper ordering
+        try:
+            merged_ts = merged_tables.tree_sequence()
+            break
+        except Exception as e:
+            if retry < 2:
+                logging.warning(f"Initial TreeSequence creation failed (attempt {retry + 1}): {e}")
+                logging.info("Attempting additional time constraint fixes...")
+                # Fix time constraints on the original dataframes with larger epsilon
+                merged_node_df = fix_time_constraints(merged_edge_df, merged_node_df, epsilon=1e-5 * (retry + 2))
+            else:
+                raise
+
+    if not run_deep_checks:
+        logging.info("Skipping optional post/pre-order checks - returning validated TreeSequence")
+        return merged_ts
+
     # Work with TableCollection for checking instead of TreeSequence b/c TS are not mutable
     tables = merged_ts.dump_tables() # return copy of tables we'll work with
     edges_df, nodes_df = treeTables2df(tables)
-    
+
     # Run post-order traversal checking child-parent relationships
     nodes_df, edges_df = postorder_check(edges_df,nodes_df,tip_count)
-    
+
     # Run pre-order traversal checking parent-child relationships
     nodes_df, edges_df = preorder_check(edges_df,nodes_df,tip_count)
-    
-    # Convert back to tskit tables
-    edges_df.drop_duplicates(inplace=True) # need to drop dups or squash will throw conflicting child/parent error
-    merged_tables = df2TreeTables(edges_df,nodes_df,total_length)
-    merged_tables.edges.squash() # squash sorts and combines "equivalent" adjacent edges
-    
-    # Attemp to simplify ARG?
-    # drop_list = []
-    # for nd_idx, nd in enumerate(tables.nodes):
-    #     if tables.nodes[nd_idx].flags == 0: # if coal node
-    #         nd_children = list(set(edges_df.loc[edges_df['parent'] == nd_idx, 'child'].tolist()))
-    #         if len(nd_children) < 2:
-    #             drop_list.append(nd_idx)
-    # node_set = set(list(range(len(tables.nodes))))
-    # nodes_to_retain = list(node_set.difference(set(drop_list)))
-    # #nodes_to_retain = list(range(10)) + [nd_idx for nd_idx, nd in enumerate(tables.nodes) if tables.nodes[nd_idx].flags == 131072]
-    # merged_tables.simplify(samples=nodes_to_retain) # simplifies but retains samples and nodes_to_retain
-    
-    merged_ts = merged_tables.tree_sequence()  
-        
+
+    # Fix any time constraint violations that may have been introduced by post/pre-order checks
+    nodes_df = fix_time_constraints(edges_df, nodes_df)
+
+    # Convert back to tskit tables with retry logic for time constraint issues
+    max_retries = 3
+    for retry in range(max_retries):
+        edges_df_clean = edges_df.drop_duplicates()  # need to drop dups or squash will throw conflicting child/parent error
+        merged_tables = df2TreeTables(edges_df_clean, nodes_df, total_length)
+        merged_tables.sort()  # Sort after time fixes to ensure proper edge ordering
+        merged_tables.edges.squash()  # squash combines "equivalent" adjacent edges
+        merged_tables.sort()  # Re-sort after squash
+
+        try:
+            merged_ts = merged_tables.tree_sequence()
+            return merged_ts
+        except Exception as e:
+            if retry < max_retries - 1:
+                logging.warning(f"TreeSequence creation failed (attempt {retry + 1}): {e}")
+                logging.info("Attempting additional time constraint fixes...")
+                # Fix time constraints on the edges/nodes with larger epsilon
+                nodes_df = fix_time_constraints(edges_df_clean, nodes_df, epsilon=1e-5 * (retry + 2))
+            else:
+                raise
+
     return merged_ts
 
 
@@ -157,18 +208,24 @@ def postorder_check(edges_df,nodes_df,tip_count):
             # Determine if parents are coalescent or recombination nodes
             parent_types = [nodes_df.at[x,'flags'] for x in nd_parents]
             #coal_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == 0] # not used
-            recomb_parents = [y for x,y in enumerate(nd_parents) if parent_types[x] == 131072]
+            recomb_parents = [y for x,y in enumerate(nd_parents) if is_recombinant(parent_types[x])]
             
             # Determine order of parents by their node times and get the most recent parent
             parent_times = [nodes_df.at[x,'time'] for x in nd_parents]
             mrp = nd_parents[np.argmin(parent_times)] # most recent parent
             mrp_type = nodes_df.at[mrp,'flags']
             
-            if mrp_type == 131072: # recomb event
-                
+            if is_recombinant(mrp_type): # recomb event
+
                 if len(recomb_parents) > 2:
                     logging.error('Warning: node has more than two recombination node parents')
-            
+
+                # Check if we have at least 2 recombination parents
+                if len(recomb_parents) < 2:
+                    logging.warning(f'Node {nd_idx} has recomb parent but fewer than 2 recomb_parents ({len(recomb_parents)}). Skipping.')
+                    nd_idx += 1
+                    continue
+
                 # Find recombinant parents
                 recomb_parent_edges_1 = edges_df.loc[(edges_df['parent'] == recomb_parents[0]) & (edges_df['child'] == nd_idx)]
                 recomb_parent_edges_2 = edges_df.loc[(edges_df['parent'] == recomb_parents[1]) & (edges_df['child'] == nd_idx)]
@@ -226,10 +283,10 @@ def postorder_check(edges_df,nodes_df,tip_count):
                     
                     # Add two addtional hidden rec nodes to nodes_df
                     time = nodes_df.at[nd_idx,'time'] + (nodes_df.at[recent_parent,'time'] - nodes_df.at[nd_idx,'time'])/2 # can just pick a random time between parent and child
-                    new_rec_node = {'flags': 131072, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
-                    nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
+                    new_rec_node = {'flags': RECOMB_FLAG, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
+                    nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
                     left_recomb_parent = len(nodes_df.index) - 1
-                    nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
+                    nodes_df = pd.concat([nodes_df, pd.DataFrame([new_rec_node])], ignore_index=True)
                     right_recomb_parent = len(nodes_df.index) - 1
                     deeper_parents.append(recent_parent) # need to include recent parent
                     for parent_nd in deeper_parents:
@@ -288,7 +345,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
         # Get parent type (coalescent/recombination)
         parent_type = nodes_df.at[nd_idx,'flags']
         
-        if parent_type == 131072: # recomb event
+        if is_recombinant(parent_type): # recomb event
             
             # Not currently accounted for
             if len(nd_children) > 1:
@@ -335,7 +392,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
                 time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_coal_time)/2 # can just pick a random time between parent and child
                 #time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_coal_time) * 0.01
                 new_coal_node = {'flags': 0, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
-                nodes_df = nodes_df.append(new_coal_node, ignore_index = True)
+                nodes_df = pd.concat([nodes_df, pd.DataFrame([new_coal_node])], ignore_index=True)
                 new_node_index = len(nodes_df.index) - 1
                 
                 for child_nd in changing_children:
@@ -357,7 +414,7 @@ def preorder_check(edges_df,nodes_df,tip_count):
                 # add two rec nodes to nodes_df
                 # min_rec_time = max(nodes_df.at[changing_children[0],'time'],nodes_df.at[changing_children[1],'time'])
                 # time = nodes_df.at[nd_idx,'time'] - (nodes_df.at[nd_idx,'time'] - min_rec_time)/2 # can just pick a random time between parent and child
-                # new_rec_node = {'flags': 131072, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
+                # new_rec_node = {'flags': RECOMB_FLAG, 'population': -1, 'individual': -1, 'time':time, 'metadata':time} # add extra edge for old parent and split node
                 # nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
                 # left_recomb_parent = len(nodes_df.index) - 1
                 # nodes_df = nodes_df.append(new_rec_node, ignore_index = True)
@@ -383,8 +440,8 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
         If it does, checks node height equality and assigns new unique id to nodes with different heights
     """
     
-    # Create empty nodes_df compatible with ts.tables.nodes
-    nodes_df = pd.DataFrame(columns=['flags', 'time', 'population', 'metadata','unique_id'])
+    # Collect rows first to avoid concat-on-empty warnings and then build the DataFrame once
+    node_rows = []
     
     # Encode bipartitions -- used fo unique node ids
     tree.encode_bipartitions(suppress_unifurcations=False)
@@ -409,12 +466,13 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
         unique_id = node.edge.split_bitmask
 
         if len(children) == 0: # node is a sampled tip
-            flags = tskit.NODE_IS_SAMPLE
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':int(node.taxon.label), 'unique_id':unique_id},ignore_index=True)
+            flags = SAMPLE_FLAG
+            metadata = str(node.taxon.label)
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':metadata, 'unique_id':unique_id})
             node.unique_id = unique_id
         elif len(children) == 1: # node is recombination event
-            flags = 131072 #recomb_flag
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id},ignore_index=True)
+            flags = RECOMB_FLAG # recomb_flag
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':recomb_id})
             node.unique_id = recomb_id
             recomb_id -= 1 # decrement recombinant node unique id counter
         else: # Coalescent node
@@ -435,9 +493,11 @@ def tree2nodesdf(tree, prev_node_df=pd.DataFrame()):
                 if not coal_time_duplicates.empty:
                     unique_id = coal_time_duplicates.iloc[0].unique_id
                 
-            nodes_df = nodes_df.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id},ignore_index=True)
+            node_rows.append({'flags':flags, 'time':node.age, 'population':-1, 'metadata':None, 'unique_id':unique_id})
             node.unique_id = unique_id
-    
+
+    nodes_df = pd.DataFrame(node_rows, columns=['flags', 'time', 'population', 'metadata','unique_id'])
+
     return nodes_df, tree                 
 
 def tree2edgedf(tree,left,right,id_dict):
@@ -446,14 +506,15 @@ def tree2edgedf(tree,left,right,id_dict):
         Converts tree into edges dataframe compatible with ts.tables.edges.
     """   
     
-    edges_df = pd.DataFrame(columns=['left', 'right', 'parent', 'child','parent_unique_id','child_unique_id'])
+    edge_rows = []
     for node in tree.ageorder_node_iter():
         children = list(node.child_nodes())
         parent_id = id_dict[node.unique_id]
         for child in children:
             child_id = id_dict[child.unique_id]
-            edges_df = edges_df.append({'left':left, 'right':right, 'parent':parent_id, 'child':child_id, 'parent_unique_id':node.unique_id, 'child_unique_id':child.unique_id}, ignore_index=True)
-                    
+            edge_rows.append({'left':left, 'right':right, 'parent':parent_id, 'child':child_id, 'parent_unique_id':node.unique_id, 'child_unique_id':child.unique_id})
+    edges_df = pd.DataFrame(edge_rows, columns=['left', 'right', 'parent', 'child','parent_unique_id','child_unique_id'])
+
     return edges_df     
 
 
@@ -464,11 +525,20 @@ def reindex_edgedf(edge_df,id_dict):
         id_dict maps unique_ids -> updated node ids
     """
 
-    for index, row in edge_df.iterrows():
-        row.parent = id_dict[row.parent_unique_id]
-        row.child = id_dict[row.child_unique_id]
-        
-    return edge_df
+    reindexed = edge_df.copy()
+    try:
+        reindexed['parent'] = [
+            id_dict[int(unique_id)]
+            for unique_id in reindexed['parent_unique_id']
+        ]
+        reindexed['child'] = [
+            id_dict[int(unique_id)]
+            for unique_id in reindexed['child_unique_id']
+        ]
+    except KeyError as e:
+        raise KeyError(f"Could not reindex edge endpoint with unique_id {e}") from e
+
+    return reindexed.astype({"parent": int, "child": int})
 
 
 def df2TreeTables(edge_df,node_df,total_length):
@@ -505,18 +575,18 @@ def treeTables2df(tables):
                   'population':tables.nodes.population,
                   'individual':tables.nodes.individual,
                   'time':tables.nodes.time,
-                  'metadata':tables.nodes.time}
+                  'metadata':[None] * len(tables.nodes)}
     nodes_df = pd.DataFrame.from_dict(nodes_dict)
     
     return edges_df, nodes_df
 
 def check_time_constraints(edge_df,node_df):
-    
+
     """
         Check to make sure parent/child nodes are in chronological order in node/edge dfs
         TODO: Not currently used -- can remove in future
     """
-    
+
     for index, row in edge_df.iterrows():
         parent = int(row['parent'])
         child = int(row['child'])
@@ -524,6 +594,82 @@ def check_time_constraints(edge_df,node_df):
         child_time = node_df.iloc[child].time
         if child_time > parent_time:
             print("WARNING: child node time is greater than parent node time for child " + str(child) + " and parent " + str(parent))
+
+
+def fix_time_constraints(edge_df, node_df, epsilon=1e-6):
+    """
+        Fix time constraint violations by adjusting parent node times.
+        tskit requires that time[parent] > time[child] for all edges.
+
+        Uses a bottom-up approach: for each node, ensure its time is greater
+        than all its children's times. Process in order of current time to
+        handle cascading fixes properly.
+
+        Parameters:
+            edge_df: DataFrame with edge information
+            node_df: DataFrame with node information
+            epsilon: Minimum time difference between parent and child
+
+        Returns:
+            node_df: DataFrame with corrected node times
+    """
+
+    # Reset index to ensure sequential integer indexing
+    node_df = node_df.reset_index(drop=True)
+
+    # Build a mapping of parent -> list of children
+    parent_to_children = {}
+    for index, row in edge_df.iterrows():
+        parent = int(row['parent'])
+        child = int(row['child'])
+        if parent not in parent_to_children:
+            parent_to_children[parent] = []
+        if child not in parent_to_children[parent]:
+            parent_to_children[parent].append(child)
+
+    total_fixes = 0
+    max_iterations = 200  # Increased limit
+
+    for iteration in range(max_iterations):
+        violations_fixed = 0
+
+        # Process nodes in order of time (lowest/youngest first)
+        # This ensures children are processed before parents
+        node_order = node_df['time'].argsort().values
+
+        for node_idx in node_order:
+            node_idx = int(node_idx)
+            if node_idx not in parent_to_children:
+                continue  # Leaf node, no children
+
+            children = parent_to_children[node_idx]
+            parent_time = node_df.iloc[node_idx]['time']
+
+            # Find the maximum child time
+            max_child_time = max(node_df.iloc[c]['time'] for c in children)
+
+            if parent_time <= max_child_time:
+                # Fix by moving parent time above max child time
+                new_parent_time = max_child_time + epsilon
+                node_df.iloc[node_idx, node_df.columns.get_loc('time')] = new_parent_time
+                violations_fixed += 1
+                total_fixes += 1
+
+        if violations_fixed == 0:
+            break
+
+    if iteration == max_iterations - 1:
+        logging.warning(f"Reached max iterations ({max_iterations}) while fixing time constraints. Some violations may remain.")
+        # Last resort: ensure strict ordering by sorting and adding epsilon offsets
+        unique_times = sorted(node_df['time'].unique())
+        time_map = {t: i * epsilon for i, t in enumerate(unique_times)}
+        node_df['time'] = node_df['time'].map(time_map)
+        logging.info("Applied strict time ordering as fallback")
+
+    if total_fixes > 0:
+        logging.info(f"Fixed {total_fixes} time constraint violations in {iteration + 1} iteration(s)")
+
+    return node_df
 
 def check_parent_child_intervals(edge_df,node_df):
     
@@ -553,8 +699,8 @@ def split_edge(edges_df,parent_nd,split_nd,child_nd):
     
         edges_df.loc[edge_idx,'parent'] = split_nd # replace old parent with split node
         new_parent_edge = {'left': edge.left, 'right': edge.right, 'parent': parent_nd, 'child': split_nd} # add extra edge for old parent and split node
-        edges_df = edges_df.append(new_parent_edge, ignore_index = True)
-    
+        edges_df = pd.concat([edges_df, pd.DataFrame([new_parent_edge])], ignore_index=True)
+
     edges_df = edges_df.astype({"parent": int, "child": int}) # wish we didn't have to do this!
     return edges_df
 
@@ -575,8 +721,8 @@ def split_edge_on_rec(edges_df,parent_nd,child_nd,left_recomb_parent,right_recom
     
         edges_df.loc[edge_idx,'parent'] = rec_node # replace old parent with split node
         new_parent_edge = {'left': edge.left, 'right': edge.right, 'parent': parent_nd, 'child': rec_node} # add extra edge for old parent and split node
-        edges_df = edges_df.append(new_parent_edge, ignore_index = True)
-    
+        edges_df = pd.concat([edges_df, pd.DataFrame([new_parent_edge])], ignore_index=True)
+
     edges_df = edges_df.astype({"parent": int, "child": int}) # wish we didn't have to do this!
     return edges_df
 

@@ -5,3 +5,17 @@ build/
 dist/
 Espalier.egg-info
 Espalier/__pycache__/
+*.pyc
+
+# Data, generated outputs, and benchmark artifacts
+TestFiles/
+FluTest*/
+SimulationBenchmarks/
+EmpiricalReassortmentBenchmarks/
+benchmark_results.csv
+benchmark_summary.json
+benchmark_config.json
+arg_output_*/
+*.trees
+/scripts/ab_testing/Outputs
+scripts/ab_testing/generate_results_pdf.py

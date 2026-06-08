@@ -24,6 +24,12 @@ pip will install the other Python packages required by Espalier.
 
 However, Espalier also requires but is not packaged with RAxML-NG. Instructions for installing RAxML-NG can be found [here][raxml-ng].
 
+Simulation workflows require the optional simulation extra:
+```
+$ pip install "Espalier[simulation]"
+```
+
+
 If Espalier was installed correctly, the command
 ```
 $ espalier --help

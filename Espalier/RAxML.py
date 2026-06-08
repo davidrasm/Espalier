@@ -47,22 +47,25 @@ class RAxMLRunner(object):
         self.lsd_path = kwargs.get('lsd_path', 'lsd')
 
     def get_tree_likelihood(self,tree_file,seq_file):
-        
+
         '''
             Compute log likelihood of sequnece alignment in seq_file given tree in tree_file
-         
-            Parameters:     
+
+            Parameters:
                tree_file (str): input newick tree file
                seq_file (str): input fasta file containing seq alignment
-               
+
             Returns:
                 logL (float): log likelihood of seq data given tree
         '''
-        
+
         logL = 0
-    
+
         temp_prefix = self.temp_dir + 'temp'
-        
+
+        # Sanitize tree to fix any negative branch lengths before passing to RAxML
+        tree_file = self._sanitize_tree_file(tree_file)
+
         # Evaluatae likelihood of seq data given tree in RAxML
         cmd_args = [self.raxml_path,
                     '--evaluate --msa', seq_file,
@@ -106,22 +109,25 @@ class RAxMLRunner(object):
         
         return logL
     
-    def get_site_likelihoods(self,tree_file,seq_file):   
-        
+    def get_site_likelihoods(self,tree_file,seq_file):
+
         """
             Compute per site log likelihoods of seq data given tree using raxml
             This allows site likes to be computed without optimization of model params or branch lengths
-            
-            Parameters:     
+
+            Parameters:
                tree_file (str): input newick tree file
                seq_file (str): input fasta file containing seq alignment
-               
+
             Returns:
                 site_likes (numpy.array): site-specific log likelihood of seq data given tree
-            
+
         """
-        
+
         temp_prefix = self.temp_dir + 'temp'
+
+        # Sanitize tree to fix any negative branch lengths before passing to RAxML
+        tree_file = self._sanitize_tree_file(tree_file)
 
         # Evaluatae likelihood of seq data given tree in RAxML
         cmd_args = [self.raxml_path,
@@ -169,17 +175,135 @@ class RAxMLRunner(object):
        
     
     def _parse_best_model(self,best_model_file):
-    
+
         """
             Parse model from *.raxml.bestModel output
-        """    
-    
+        """
+
         f = open(best_model_file)
         line = f.readline()
         f.close()
         model = line.split(',')[0]
-        
+
         return model
+
+    def _sanitize_tree_file(self, tree_file, min_branch_length=1e-9):
+        """
+            Sanitize tree file to fix negative or zero branch lengths.
+            RAxML-NG will fail if the tree contains negative branch lengths.
+
+            Parameters:
+                tree_file (str): input newick tree file
+                min_branch_length (float): minimum allowed branch length
+
+            Returns:
+                tree_file (str): path to sanitized tree file (may be same or new temp file)
+        """
+        try:
+            tree = dendropy.Tree.get(path=tree_file, schema="newick", rooting="default-rooted")
+
+            needs_fix = False
+            for edge in tree.postorder_edge_iter():
+                if edge.length is not None and edge.length < min_branch_length:
+                    needs_fix = True
+                    break
+
+            if needs_fix:
+                logging.debug(f"Fixing negative/zero branch lengths in {tree_file}")
+                for edge in tree.postorder_edge_iter():
+                    if edge.length is not None and edge.length < min_branch_length:
+                        edge.length = min_branch_length
+
+                # Write sanitized tree to a temp file
+                sanitized_file = self.temp_dir + 'temp_sanitized.tre'
+                tree.write(path=sanitized_file, schema='newick',
+                          suppress_annotations=True, suppress_rooting=True)
+                return sanitized_file
+
+        except Exception as e:
+            logging.warning(f"Could not sanitize tree file {tree_file}: {e}")
+
+        return tree_file
+
+    def get_raxml_tree(self, seq_file, tree_file, dirty=True, parse_model=True, root=True, outgroup_taxon=None):
+
+        """
+            Reconstruct an ML tree from an input alignment using RAxML-NG.
+
+            Parameters:
+               seq_file (str): Input alignment file
+               tree_file (str): Output newick tree file
+
+            Optional keyword arguments:
+               dirty (boolean): Perform quick and dirty tree search from a single starting tree?
+               parse_model (boolean): Parse best model from tree reconstruction output and set as current model
+               root (boolean): Root unrooted ML tree before writing to output file?
+               outgroup_taxon: taxon label used for rooting if provided
+
+            Returns:
+               None (writes ML tree to tree_file)
+        """
+
+        temp_prefix = self.temp_dir + 'temp'
+
+        search_mode = ''
+        if dirty:
+            search_mode = '--search1'
+
+        cmd_args = [self.raxml_path]
+        if search_mode:
+            cmd_args.append(search_mode)
+        cmd_args.extend([
+            '--msa', seq_file,
+            '--model', 'GTR+G',
+            '--prefix', temp_prefix,
+            '--threads', str(self.threads),
+            '--seed', str(self.seed),
+            '--redo',
+        ])
+        cmd = ' '.join(cmd_args)
+
+        try:
+            output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as exc:
+            logging.error(exc.output)
+            logging.error('Execution of "%s" failed!\n' % cmd)
+            sys.exit(1)
+
+        if parse_model:
+            best_model_file = temp_prefix + '.raxml.bestModel'
+            self.model = self._parse_best_model(best_model_file)
+
+        try:
+            os.rename(temp_prefix + '.raxml.bestTree', tree_file)
+        except OSError:
+            pass
+
+        if root:
+            taxa = dendropy.TaxonNamespace()
+            tree = dendropy.Tree.get(
+                file=open(tree_file, 'r'),
+                schema="newick",
+                taxon_namespace=taxa,
+                preserve_underscores=True,
+            )
+            if outgroup_taxon:
+                outgroup_node = tree.find_node_with_taxon_label(outgroup_taxon)
+                new_root_node = outgroup_node.parent_node
+                tree.reroot_at_node(new_root_node, collapse_unrooted_basal_bifurcation=False)
+                tree.prune_taxa_with_labels([outgroup_taxon])
+            else:
+                tree.reroot_at_midpoint()
+            tree.write(path=tree_file, schema='newick', suppress_annotations=True, suppress_rooting=True)
+
+        try:
+            os.remove(temp_prefix + '.raxml.rba')
+            os.remove(temp_prefix + '.raxml.startTree')
+            os.remove(temp_prefix + '.raxml.bestModel')
+            os.remove(temp_prefix + '.raxml.log')
+            os.remove(temp_prefix + '.raxml.bestTreeCollapsed')
+        except OSError:
+            pass
     
     
     def get_dated_raxml_tree(self,seq_file,tree_file,tip_date_file,rate_file,dirty=True,parse_model=True,root=True,outgroup_taxon=None):
@@ -288,7 +412,7 @@ class RAxMLRunner(object):
                     if "tree 1 =" in line:
                         tree = line.split()[3]
                     line = f.readline()
-                tree = re.sub("[\[].*?[\]]", "", tree) # remove metadata in brackets
+                tree = re.sub(r"\[.*?\]", "", tree) # remove metadata in brackets
                 f.close()
                 nwk=open(tree_file,"w")
                 nwk.write(tree + '\n')

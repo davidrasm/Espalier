@@ -1,12 +1,18 @@
 name: espalier
 channels:
+  - conda-forge
 dependencies:
-  - python=3.10.*
-  - scipy
-  - numpy
+  - python=3.11.*
+  - numpy=2.4.6
+  - scipy=1.17.1
   - matplotlib
-  - pandas
+  - pandas=3.0.3
   - seaborn
   - spyder
-  - biopython
-  - dendropy
+  - biopython=1.87
+  - dendropy=5.0.8
+  - tskit=1.0.3
+  - click=8.4.1
+  - msprime=1.4.2
+  - pyvolve=1.1.0
+  - pytest=9.0.3
