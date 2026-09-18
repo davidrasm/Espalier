@@ -16,7 +16,7 @@ def batch_test(plot=False):
     
     sample_size = 100
     sims = 100
-    max_cuts = 1
+    max_cuts = 5
     sample_sizes = [sample_size]*sims
     spr_moves = []
     spr_dists_4cut = []
@@ -69,16 +69,17 @@ def batch_test(plot=False):
     
     "Split methods into different results"
     data_4cut = {'TrueSPRMoves':spr_moves,'SPRDist':spr_dists_4cut,'SampleSizes':sample_sizes,'Method':['4Cut']*sims}
-    df = pd.DataFrame(data_4cut)
+    df_4cut = pd.DataFrame(data_4cut)
     
     data_3approx = {'TrueSPRMoves':spr_moves,'SPRDist':spr_dists_3approx,'SampleSizes':sample_sizes,'Method':['3Approx']*sims}
     df_3approx = pd.DataFrame(data_3approx)
-    df = df.append(df_3approx)
     
-    df.to_csv("test_MAF_randomSPRS_4cut_vs_3approx_maxSPR1_s100_results.csv",index=False)
+    df = pd.concat([df_4cut, df_3approx], ignore_index=True)
+    
+    df.to_csv("test_MAF_randomSPRS_4cut_vs_3approx_maxSPR5_s100_results.csv",index=False)
 
 "Batch test"
-batch = False
+batch = True
 if batch:
     batch_test()
 else:

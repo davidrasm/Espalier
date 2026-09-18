@@ -46,7 +46,73 @@ class RAxMLRunner(object):
         self.raxml_path = kwargs.get('raxml_path', 'raxml-ng')
         self.lsd_path = kwargs.get('lsd_path', 'lsd')
 
-    def get_tree_likelihood(self,tree_file,seq_file):
+
+    def get_best_model(self,tree_file,seq_file,opt_branches=True):
+
+        '''
+            Get best fitting substitution model for sequnece alignment in seq_file given tree in tree_file
+            by optimizing model.
+
+            Parameters:
+               tree_file (str): input newick tree file
+               seq_file (str): input fasta file containing seq alignment
+               
+            Optional keyword arguments:
+                opt_branches (boolean): RAxML will optimize branch lengths if True
+
+            Returns:
+                model (str): best fitting model in RAxML string format
+        '''
+
+        temp_prefix = self.temp_dir + 'temp'
+
+        # Sanitize tree to fix any negative branch lengths before passing to RAxML
+        tree_file = self._sanitize_tree_file(tree_file)
+
+        if opt_branches:
+            opt_branches = 'on'
+        else:
+            opt_branches = 'off'
+
+        # Evaluatae likelihood of seq data given tree in RAxML
+        cmd_args = [self.raxml_path,
+                    '--evaluate --msa', seq_file,
+                    '--threads', str(self.threads),
+                    '--model', 'GTR', #self.model,
+                    '--tree', tree_file,
+                    '--prefix', temp_prefix,
+                    '--opt-model', 'on',
+                    '--opt-branches', opt_branches, 
+                    '--redo']
+        cmd = ' '.join(cmd_args)
+
+        try:
+            output = subprocess.check_output(cmd, shell=True,stderr=subprocess.STDOUT)
+            #sys.stdout.write(output)
+        except subprocess.CalledProcessError as exc:
+            logging.error(exc.output)
+            logging.error('Execution of "%s" failed!\n' % cmd)
+            sys.exit(1)
+        
+        # Parse best model from output
+        best_model_file = temp_prefix + '.raxml.bestModel'
+        model = self._parse_best_model(best_model_file)
+        
+        # Clean up
+        try:
+            os.remove(temp_prefix + '.raxml.bestModel')
+            os.remove(temp_prefix + '.raxml.bestTree')
+            os.remove(temp_prefix + '.raxml.bestTreeCollapsed')
+            os.remove(temp_prefix + '.raxml.log')
+            os.remove(temp_prefix + '.raxml.rba')
+            os.remove(temp_prefix + '.raxml.siteLH')
+            os.remove(temp_prefix + '.raxml.startTree')
+        except OSError:
+            pass
+        
+        return model
+
+    def get_tree_likelihood(self,tree_file,seq_file,opt_model=False,opt_branches=False):
 
         '''
             Compute log likelihood of sequnece alignment in seq_file given tree in tree_file
@@ -54,6 +120,10 @@ class RAxMLRunner(object):
             Parameters:
                tree_file (str): input newick tree file
                seq_file (str): input fasta file containing seq alignment
+               
+            Optional keyword arguments:
+                opt_model (boolean): RAxML will optimize substitution model if True
+                opt_branches (boolean): RAxML will optimize branch lengths if True
 
             Returns:
                 logL (float): log likelihood of seq data given tree
@@ -66,6 +136,16 @@ class RAxMLRunner(object):
         # Sanitize tree to fix any negative branch lengths before passing to RAxML
         tree_file = self._sanitize_tree_file(tree_file)
 
+        if opt_model:
+            opt_model = 'on'
+        else:
+            opt_model = 'off'
+
+        if opt_branches:
+            opt_branches = 'on'
+        else:
+            opt_branches = 'off'
+
         # Evaluatae likelihood of seq data given tree in RAxML
         cmd_args = [self.raxml_path,
                     '--evaluate --msa', seq_file,
@@ -73,8 +153,8 @@ class RAxMLRunner(object):
                     '--model', self.model,
                     '--tree', tree_file,
                     '--prefix', temp_prefix,
-                    '--opt-model', 'off',
-                    '--opt-branches', 'off', 
+                    '--opt-model', opt_model,
+                    '--opt-branches', opt_branches, 
                     '--redo']
         cmd = ' '.join(cmd_args)
 
